@@ -1,5 +1,6 @@
 
-
+----- Dataset Modification -----
+60 files with the title case_019_week_1_slice_*.nii.gz was removed before training due to the dimension of those files being (256, 144) while the remaining files were (256, 128)
 
 ----- Data access -----
 The data used for this project was the 2D hip MRI slices dataset, which was taken from Rangpur labeled as keras_slices_data
@@ -18,7 +19,9 @@ image_generation_WGAN_48016049/
 ----- Artificial Intelligence Usage Disclosure -----
 
 Claude AI
-- 
+- code
+- documentation
+- consultation with project
 
 ChatGPT
 - Assistance in generating the feasibility review, with manual editing after generation.
