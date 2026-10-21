@@ -5,6 +5,7 @@ Images are expected in [0, 1] for the VAE.
 """
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 def _bottleneck_size(img_size):
@@ -182,5 +183,362 @@ class VAE(nn.Module):
         z = torch.randn(n, self.latent_dim, device=device)
         return self.decode(z)
 
-class WGAN():
-    pass
+
+# ============================================================== WGAN-GP
+# The Generator maps a noise vector to a 256x128 image; the Critic maps an image to a
+# single realism score. Both work through 6 scales of 2x resampling (256x128 <-> 4x2).
+
+_N_SCALES = 6  # number of 2x up/down-sampling steps
+
+
+def _scale_size(img_size):
+    """Return the (H, W) of the smallest feature map, 2**_N_SCALES times smaller than the image.
+
+    Args:
+        img_size: (H, W) of the images, e.g. (256, 128). Both must be divisible by 64.
+
+    Returns:
+        (H // 64, W // 64), e.g. (4, 2) for 256x128 images.
+    """
+    H, W = img_size
+    f = 2 ** _N_SCALES
+    assert H % f == 0 and W % f == 0, f"H and W must be divisible by {f}, got {img_size}"
+    return H // f, W // f
+
+
+def _init_weights(m):
+    """DCGAN-style initialisation: weights ~ N(0, 0.02), biases 0, BatchNorm scale ~ N(1, 0.02)."""
+    if isinstance(m, (nn.Conv2d, nn.Linear)):
+        nn.init.normal_(m.weight, 0.0, 0.02)
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+    elif isinstance(m, nn.BatchNorm2d):
+        nn.init.normal_(m.weight, 1.0, 0.02)
+        nn.init.zeros_(m.bias)
+
+
+class _UpBlock(nn.Module):
+    """Generator block that doubles the spatial size: Upsample -> (Conv -> BatchNorm -> ReLU) x 2.
+
+    Nearest-neighbour upsampling followed by an ordinary convolution is used instead of a
+    transposed convolution, because it avoids the checkerboard artefacts that transposed
+    convolutions tend to leave in generated images.
+    """
+
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="nearest"),
+            nn.Conv2d(in_ch, out_ch, 3, 1, 1, bias=False), nn.BatchNorm2d(out_ch), nn.ReLU(),
+            nn.Conv2d(out_ch, out_ch, 3, 1, 1, bias=False), nn.BatchNorm2d(out_ch), nn.ReLU(),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class _DownBlock(nn.Module):
+    """Critic block that halves the spatial size: (Conv3x3 -> Norm -> LeakyReLU) then
+    (Conv4x4 stride 2 -> Norm -> LeakyReLU).
+
+    The normalisation is GroupNorm(1, C), which is layer normalisation over (C, H, W). It works
+    on each image separately, so it is safe with the gradient penalty (BatchNorm is not, since
+    it mixes information between the images in a batch).
+    """
+
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, 1, 1), nn.GroupNorm(1, out_ch), nn.LeakyReLU(0.2),
+            nn.Conv2d(out_ch, out_ch, 4, 2, 1), nn.GroupNorm(1, out_ch), nn.LeakyReLU(0.2),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class Generator(nn.Module):
+    """Maps a latent vector z ~ N(0, I) to an image in [-1, 1] (Tanh output).
+
+    Shapes for the default 256x128 images (channels x height x width), base=64:
+        z                128
+        projection       512 x 4 x 2
+        after block 1    512 x 8 x 4
+        after block 2    256 x 16 x 8
+        after block 3    128 x 32 x 16
+        after block 4     64 x 64 x 32
+        after block 5     32 x 128 x 64
+        after block 6     32 x 256 x 128
+        output             1 x 256 x 128, values in [-1, 1]
+
+    Args:
+        z_dim: size of the latent vector.
+        out_channels: number of image channels (1 for greyscale MRI).
+        img_size: (H, W) of the output; both must be divisible by 64.
+        base: width multiplier. The widest layer has base * 8 channels. Use 64 for the full
+            model (about 8M parameters); smaller values train faster but give less detail.
+    """
+
+    def __init__(self, z_dim=128, out_channels=1, img_size=(256, 128), base=64):
+        super().__init__()
+        self.z_dim = z_dim
+        self.h0, self.w0 = _scale_size(img_size)
+        ch = [base * 8, base * 8, base * 4, base * 2, base, base // 2, base // 2]
+        assert len(ch) == _N_SCALES + 1
+        self.c0 = ch[0]
+
+        self.project = nn.Linear(z_dim, self.c0 * self.h0 * self.w0)    # z -> 512 x 4 x 2 feature map
+        self.project_norm = nn.Sequential(nn.BatchNorm2d(self.c0), nn.ReLU())
+        self.blocks = nn.Sequential(*[_UpBlock(ch[i], ch[i + 1]) for i in range(_N_SCALES)])
+        self.to_img = nn.Sequential(nn.Conv2d(ch[-1], out_channels, 3, 1, 1), nn.Tanh())
+        self.apply(_init_weights)
+
+    def forward(self, z):
+        """Generate images from latent vectors.
+
+        Args:
+            z: (B, z_dim) noise.
+
+        Returns:
+            (B, out_channels, H, W) images in [-1, 1].
+        """
+        x = self.project(z).view(-1, self.c0, self.h0, self.w0)
+        return self.to_img(self.blocks(self.project_norm(x)))
+
+    @torch.no_grad()
+    def generate(self, n):
+        """Generate n images from fresh noise, mapped back to [0, 1] for saving and evaluation.
+
+        Call model.eval() first so BatchNorm uses its running statistics.
+
+        Returns:
+            (n, out_channels, H, W) images in [0, 1], on the model's device.
+        """
+        z = torch.randn(n, self.z_dim, device=next(self.parameters()).device)
+        return (self(z) + 1) / 2
+
+
+class Critic(nn.Module):
+    """WGAN-GP critic: maps an image in [-1, 1] to one unbounded realism score.
+
+    The score is not a probability (no sigmoid): higher means "more like real data". Training
+    pushes real scores up and generated scores down, and the 1-Lipschitz constraint that
+    makes this a valid Wasserstein estimate is enforced by the gradient penalty in train.py.
+    The architecture's part in that is to avoid BatchNorm (see _DownBlock).
+
+    Shapes for the default 256x128 images, base=64:
+        input           1 x 256 x 128
+        after block 1   32 x 128 x 64
+        after block 2   64 x 64 x 32
+        after block 3  128 x 32 x 16
+        after block 4  256 x 16 x 8
+        after block 5  512 x 8 x 4
+        after block 6  512 x 4 x 2   -> flatten (4096) -> linear -> 1 score
+
+    Args:
+        in_channels: number of image channels.
+        img_size: (H, W) of the input; both must be divisible by 64.
+        base: width multiplier, as in Generator (about 14M parameters at 64).
+    """
+
+    def __init__(self, in_channels=1, img_size=(256, 128), base=64):
+        super().__init__()
+        h, w = _scale_size(img_size)
+        ch = [in_channels, base // 2, base, base * 2, base * 4, base * 8, base * 8]
+        assert len(ch) == _N_SCALES + 1
+        self.blocks = nn.Sequential(*[_DownBlock(ch[i], ch[i + 1]) for i in range(_N_SCALES)])
+        self.fc = nn.Linear(ch[-1] * h * w, 1)
+        self.apply(_init_weights)
+
+    def forward(self, x):
+        """Score a batch of images.
+
+        Args:
+            x: (B, C, H, W) images in [-1, 1].
+
+        Returns:
+            (B,) tensor of scores.
+        """
+        return self.fc(self.blocks(x).flatten(1)).view(-1)
+
+# ================================================================ VQ-VAE
+# An autoencoder whose bottleneck is DISCRETE: each cell of the encoder's feature map is
+# replaced by the closest of K learned "codebook" vectors. An image becomes a small grid of
+# integers (32 x 16 codes for a 256 x 128 slice), and the decoder rebuilds the image from the
+# codebook vectors those integers point to. Reconstruction is direct (encode -> quantize ->
+# decode), which is what the SSIM > 0.6 target measures. New images are made later by
+# sampling code grids from a separate prior model (see the prior section).
+
+
+class VectorQuantizer(nn.Module):
+    """Snap each latent vector to its nearest codebook entry (vector quantization).
+
+    The codebook is not trained by gradient descent. Each entry is instead an exponential
+    moving average (EMA) of the encoder vectors assigned to it, which is more stable than the
+    original codebook loss. Two safeguards fight "codebook collapse" (the discrete form of mode
+    collapse, where only a few codes ever get used):
+        - the codebook is initialised from real encoder outputs in the first training step;
+        - a code whose EMA usage falls below `reset_threshold` is replaced by a random encoder
+          vector from the current batch ("dead code reset").
+
+    Gradients cannot pass through the nearest-neighbour lookup, so the straight-through
+    estimator is used: the forward pass outputs the quantized vectors, while the backward pass
+    copies the gradient from the decoder input straight onto the encoder output.
+
+    Args:
+        num_codes: codebook size K (number of distinct codes).
+        dim: size of each code vector.
+        beta: weight of the commitment loss, which pulls encoder outputs towards their codes.
+        decay: EMA decay for the codebook (closer to 1 = slower, smoother updates).
+        reset_threshold: EMA usage (vectors per batch) below which a code counts as dead.
+    """
+
+    def __init__(self, num_codes=512, dim=64, beta=0.25, decay=0.99, eps=1e-5, reset_threshold=0.1):
+        super().__init__()
+        self.num_codes, self.dim, self.beta = num_codes, dim, beta
+        self.decay, self.eps, self.reset_threshold = decay, eps, reset_threshold
+        embed = torch.randn(num_codes, dim)
+        # Buffers are saved in the checkpoint but are not trained by the optimiser.
+        self.register_buffer("embed", embed)                         # (K, D) the codebook
+        self.register_buffer("embed_avg", embed.clone())             # EMA of the sum of assigned vectors
+        self.register_buffer("cluster_size", torch.ones(num_codes))  # EMA of how often each code is used
+        self.register_buffer("initted", torch.zeros((), dtype=torch.bool))
+
+    def forward(self, z):
+        """Quantize a batch of feature maps.
+
+        Args:
+            z: (B, D, H, W) encoder output.
+
+        Returns:
+            quantized: (B, D, H, W) codebook vectors with straight-through gradients.
+            commit_loss: scalar, beta * mean squared distance between z and its codes.
+            idx: (B, H, W) integer code index of every cell.
+            perplexity: scalar, effective number of codes used in this batch
+                (K = all used equally, 1 = a single code; a falling value warns of collapse).
+        """
+        B, D, H, W = z.shape
+        flat = z.permute(0, 2, 3, 1).reshape(-1, D)                  # (B*H*W, D) one row per cell
+
+        if self.training and not bool(self.initted):                 # first step: start the codebook on real data
+            pick = torch.randint(0, len(flat), (self.num_codes,), device=flat.device)
+            self.embed.copy_(flat.detach()[pick])
+            self.embed_avg.copy_(self.embed)
+            self.initted.fill_(True)
+
+        # Squared distance from every vector to every code: |x|^2 - 2 x.e + |e|^2
+        dist = flat.pow(2).sum(1, keepdim=True) - 2 * flat @ self.embed.t() + self.embed.pow(2).sum(1)[None]
+        idx = dist.argmin(1)                                         # nearest code per vector
+        quantized = F.embedding(idx, self.embed)                     # (B*H*W, D)
+
+        counts = torch.bincount(idx, minlength=self.num_codes).to(flat.dtype)
+        if self.training:
+            with torch.no_grad():
+                self.cluster_size.mul_(self.decay).add_(counts, alpha=1 - self.decay)
+                sums = torch.zeros_like(self.embed).index_add_(0, idx, flat.detach())
+                self.embed_avg.mul_(self.decay).add_(sums, alpha=1 - self.decay)
+
+                dead = self.cluster_size < self.reset_threshold      # replace unused codes with real vectors
+                if bool(dead.any()):
+                    pick = torch.randint(0, len(flat), (int(dead.sum()),), device=flat.device)
+                    self.embed_avg[dead] = flat.detach()[pick]
+                    self.cluster_size[dead] = 1.0
+
+                n = self.cluster_size.sum()                          # Laplace smoothing avoids dividing by ~0
+                size = (self.cluster_size + self.eps) / (n + self.num_codes * self.eps) * n
+                self.embed.copy_(self.embed_avg / size.unsqueeze(1))
+
+        commit_loss = self.beta * F.mse_loss(flat, quantized.detach())
+        quantized = flat + (quantized - flat).detach()               # straight-through estimator
+        probs = counts / counts.sum()
+        perplexity = torch.exp(-(probs * torch.log(probs + 1e-10)).sum())
+        return quantized.view(B, H, W, D).permute(0, 3, 1, 2), commit_loss, idx.view(B, H, W), perplexity
+
+    def lookup(self, idx):
+        """Turn a grid of code indices (B, H, W) into feature maps (B, D, H, W)."""
+        return F.embedding(idx, self.embed).permute(0, 3, 1, 2)
+
+
+class _ResBlock(nn.Module):
+    """Residual block: x + Conv1x1(ReLU(Conv3x3(ReLU(x)))). Adds depth without changing the shape."""
+
+    def __init__(self, ch, hidden):
+        super().__init__()
+        self.net = nn.Sequential(nn.ReLU(), nn.Conv2d(ch, hidden, 3, 1, 1), nn.ReLU(), nn.Conv2d(hidden, ch, 1))
+
+    def forward(self, x):
+        return x + self.net(x)
+
+
+class VQVAE(nn.Module):
+    """Vector-quantised autoencoder for 256x128 single-channel slices.
+
+    Shapes for the default 256x128 input (channels x height x width):
+        input         1 x 256 x 128
+        encoder       128 x 32 x 16     (three stride-2 convolutions, 8x smaller)
+        pre-quant      64 x 32 x 16     (1x1 conv to the code dimension)
+        code grid           32 x 16     (512 integers, each in [0, num_codes))
+        decoder out    1 x 256 x 128    values in [0, 1] (Sigmoid)
+
+    Args:
+        in_channels: image channels (1 for greyscale MRI).
+        img_size: (H, W) of the input; both must be divisible by 8.
+        hidden: channel width of the encoder and decoder.
+        res_hidden: channel width inside the residual blocks.
+        num_res: residual blocks in the encoder and in the decoder.
+        num_codes: codebook size K.
+        code_dim: size of each code vector.
+        beta: commitment-loss weight (see VectorQuantizer).
+        decay: EMA decay of the codebook (see VectorQuantizer).
+    """
+
+    def __init__(self, in_channels=1, img_size=(256, 128), hidden=128, res_hidden=64, num_res=2,
+                 num_codes=512, code_dim=64, beta=0.25, decay=0.99):
+        super().__init__()
+        H, W = img_size
+        assert H % 8 == 0 and W % 8 == 0, "H and W must be divisible by 8"
+        self.grid = (H // 8, W // 8)                                 # size of the code grid, e.g. (32, 16)
+        self.num_codes = num_codes
+
+        # Encoder: 1x256x128 -> 64x128x64 -> 128x64x32 -> 128x32x16 -> residual blocks -> 64x32x16
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_channels, hidden // 2, 4, 2, 1), nn.ReLU(),
+            nn.Conv2d(hidden // 2, hidden, 4, 2, 1), nn.ReLU(),
+            nn.Conv2d(hidden, hidden, 4, 2, 1),
+            *[_ResBlock(hidden, res_hidden) for _ in range(num_res)],
+            nn.ReLU(), nn.Conv2d(hidden, code_dim, 1),
+        )
+        self.vq = VectorQuantizer(num_codes, code_dim, beta, decay)
+        # Decoder mirrors the encoder: 64x32x16 -> 128x32x16 -> residual blocks -> upsample three times
+        self.decoder = nn.Sequential(
+            nn.Conv2d(code_dim, hidden, 3, 1, 1),
+            *[_ResBlock(hidden, res_hidden) for _ in range(num_res)],
+            nn.ReLU(), nn.ConvTranspose2d(hidden, hidden // 2, 4, 2, 1), nn.ReLU(),
+            nn.ConvTranspose2d(hidden // 2, hidden // 2, 4, 2, 1), nn.ReLU(),
+            nn.ConvTranspose2d(hidden // 2, in_channels, 4, 2, 1), nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        """Full pass used in training: encode, quantize, decode.
+
+        Args:
+            x: (B, C, H, W) images in [0, 1].
+
+        Returns:
+            recon: (B, C, H, W) reconstruction of x.
+            commit_loss: scalar commitment loss (add to the reconstruction loss).
+            idx: (B, H/8, W/8) code indices.
+            perplexity: scalar, effective number of codes in use in this batch.
+        """
+        q, commit_loss, idx, perplexity = self.vq(self.encoder(x))
+        return self.decoder(q), commit_loss, idx, perplexity
+
+    @torch.no_grad()
+    def encode_indices(self, x):
+        """Images -> integer code grids (B, H/8, W/8). Used to train the prior and to audit code usage."""
+        return self.vq(self.encoder(x))[2]
+
+    @torch.no_grad()
+    def decode_indices(self, idx):
+        """Integer code grids (B, H/8, W/8) -> images (B, C, H, W) in [0, 1]. Used to turn sampled codes into images."""
+        return self.decoder(self.vq.lookup(idx))
