@@ -542,3 +542,104 @@ class VQVAE(nn.Module):
     def decode_indices(self, idx):
         """Integer code grids (B, H/8, W/8) -> images (B, C, H, W) in [0, 1]. Used to turn sampled codes into images."""
         return self.decoder(self.vq.lookup(idx))
+
+# ================================================================ Code prior
+# A VQ-VAE only reconstructs. To generate NEW images, a second model learns which code grids
+# real images produce, then samples new grids that the VQ-VAE decoder turns into images.
+
+
+class CodePrior(nn.Module):
+    """Autoregressive transformer over a VQ-VAE code grid, read in raster order (row by row).
+
+    At every position it predicts a distribution over the next code from all codes before it.
+    The input is the grid shifted right by one place, with a special start token in front, and a
+    causal mask stops a position from seeing later ones. Position is encoded as separate learned
+    row and column embeddings, so the model knows where in the image each code sits.
+
+    Args:
+        num_codes: codebook size K of the VQ-VAE (token ids are 0..K-1; K is the start token).
+        grid: (rows, cols) of the code grid, e.g. (32, 16).
+        dim: transformer width.
+        layers: number of transformer layers.
+        heads: attention heads (must divide dim).
+        dropout: dropout rate; the main defence against memorising the training grids.
+    """
+
+    def __init__(self, num_codes=512, grid=(32, 16), dim=256, layers=6, heads=8, dropout=0.1):
+        super().__init__()
+        self.num_codes, self.grid = num_codes, tuple(grid)
+        L = self.grid[0] * self.grid[1]                              # sequence length, e.g. 512
+        self.seq_len = L
+        self.tok = nn.Embedding(num_codes + 1, dim)                  # +1 for the start token
+        self.pos_row = nn.Embedding(self.grid[0], dim)
+        self.pos_col = nn.Embedding(self.grid[1], dim)
+        block = nn.TransformerEncoderLayer(dim, heads, 4 * dim, dropout, activation="gelu",
+                                           batch_first=True, norm_first=True)
+        self.blocks = nn.TransformerEncoder(block, layers, enable_nested_tensor=False)
+        self.norm = nn.LayerNorm(dim)
+        self.head = nn.Linear(dim, num_codes)
+        pos = torch.arange(L)
+        self.register_buffer("rows", pos // self.grid[1], persistent=False)   # row of each sequence position
+        self.register_buffer("cols", pos % self.grid[1], persistent=False)    # column of each position
+        # Causal mask: -inf above the diagonal so position t cannot attend to positions after t
+        self.register_buffer("mask", torch.full((L, L), float("-inf")).triu(1), persistent=False)
+
+    def forward(self, tokens):
+        """Next-code logits for every position.
+
+        Args:
+            tokens: (B, T) long tensor, T <= seq_len, starting with the start token.
+
+        Returns:
+            (B, T, num_codes) logits; entry t scores the code that comes AFTER position t.
+        """
+        T = tokens.size(1)
+        x = self.tok(tokens) + self.pos_row(self.rows[:T]) + self.pos_col(self.cols[:T])
+        x = self.blocks(x, mask=self.mask[:T, :T])
+        return self.head(self.norm(x))
+
+    def loss(self, idx):
+        """Mean cross-entropy (nats per code) of a batch of code grids.
+
+        Args:
+            idx: (B, H, W) long tensor of code indices from VQVAE.encode_indices.
+        """
+        flat = idx.flatten(1)                                        # (B, L) raster order
+        start = torch.full((flat.size(0), 1), self.num_codes, dtype=flat.dtype, device=flat.device)
+        logits = self(torch.cat([start, flat[:, :-1]], dim=1))       # shift right: predict code t from codes < t
+        return F.cross_entropy(logits.reshape(-1, self.num_codes), flat.reshape(-1))
+
+    @torch.no_grad()
+    def sample(self, n, temperature=1.0, top_k=None):
+        """Draw n new code grids, one code at a time.
+
+        Call prior.eval() first so dropout is off.
+
+        The sequence is always padded up to a multiple of 64 positions. This keeps the number of
+        distinct tensor shapes at 8 instead of 512, so the GPU memory cache can reuse its blocks
+        (with 512 shapes it grew without limit and, on Windows, spilled into slow shared memory).
+        The causal mask means the padding after the current position cannot affect the result.
+
+        Args:
+            n: number of grids to draw.
+            temperature: below 1 gives safer, blurrier-but-cleaner grids; above 1 more variety and more errors.
+            top_k: if set, only the k most likely codes are considered at each step.
+
+        Returns:
+            (n, H, W) long tensor of code indices, ready for VQVAE.decode_indices.
+        """
+        device = next(self.parameters()).device
+        L = self.seq_len
+        toks = torch.full((n, L), self.num_codes, dtype=torch.long, device=device)   # input: start token, then codes so far
+        codes = torch.zeros(n, L, dtype=torch.long, device=device)                    # the sampled grid
+        for t in range(L):
+            T = min(L, (t // 64 + 1) * 64)                           # padded prefix length (8 distinct values)
+            logits = self(toks[:, :T])[:, t] / temperature           # distribution for code t
+            if top_k:
+                kth = logits.topk(top_k, dim=-1).values[:, -1:]
+                logits = logits.masked_fill(logits < kth, float("-inf"))
+            nxt = torch.multinomial(F.softmax(logits, dim=-1), 1)[:, 0]
+            codes[:, t] = nxt
+            if t + 1 < L:
+                toks[:, t + 1] = nxt                                 # becomes the input for the next position
+        return codes.view(n, *self.grid)

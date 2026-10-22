@@ -2,6 +2,9 @@
 
     python train.py vae  --epochs 50
     python train.py vae  --debug --epochs 1     # quick smoke test (data mostly zeros)
+    python train.py vqvae --epochs 40 --vae_ref 0.49 --out models/vqvae_run1
+    python train.py vqvae --debug --epochs 2    # quick smoke test
+    python train.py prior --vqvae models/vqvae_run1/vqvae_best.pt --epochs 30 --out models/prior_run1
     python train.py wgan --iters 10000 --eval_every 250 --vae_ref 0.49 --out models/wgan_run1
     python train.py wgan --debug --iters 20 --eval_every 10 --n_eval 16 --n_recon 8 --recon_steps 20
 
@@ -24,7 +27,11 @@ import torch.nn.functional as F
 from torchvision.utils import save_image
 
 from dataset import get_dataloaders
-from modules import VAE, Generator, Critic
+from modules import VAE, VQVAE, Generator, Critic, CodePrior
+try:
+    from modules import Encoder        # only needed for the optional `wgan --encoder` experiment
+except ImportError:
+    Encoder = None
 
 
 def parse_args():
@@ -35,7 +42,7 @@ def parse_args():
     affect that model.
     """
     p = argparse.ArgumentParser()
-    p.add_argument("model", choices=["vae", "wgan"])
+    p.add_argument("model", choices=["vae", "vqvae", "prior", "wgan"])
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--lr", type=float, default=None, help="default 1e-3 (vae), 1e-4 (wgan)")
@@ -55,6 +62,21 @@ def parse_args():
     p.add_argument("--n_eval", type=int, default=128, help="WGAN: generated images scored by the SSIM metrics")
     p.add_argument("--snapshot_every", type=int, default=2000, help="WGAN: iterations between permanent checkpoints")
     p.add_argument("--augment", type=float, default=0.0, help="WGAN: max random shift of critic inputs as a fraction of image size (0 = off, 0.1 suggested)")
+    p.add_argument("--encoder", action="store_true", help="WGAN: also train an encoder so images are reconstructed directly (Generator(Encoder(x)))")
+    p.add_argument("--lam_rec", type=float, default=50.0, help="WGAN encoder: weight on the reconstruction loss (L1 + 1 - SSIM)")
+    p.add_argument("--lam_kl", type=float, default=1.0, help="WGAN encoder: weight on the mean-per-dimension KL term that keeps the latents near N(0, I)")
+    p.add_argument("--num_codes", type=int, default=512, help="VQ-VAE: codebook size K")
+    p.add_argument("--code_dim", type=int, default=64, help="VQ-VAE: size of each code vector")
+    p.add_argument("--vq_hidden", type=int, default=128, help="VQ-VAE: channel width of the encoder and decoder")
+    p.add_argument("--commit", type=float, default=0.25, help="VQ-VAE: commitment-loss weight")
+    p.add_argument("--ssim_weight", type=float, default=1.0, help="VQ-VAE: weight on the (1 - SSIM) term of the reconstruction loss")
+    p.add_argument("--vqvae", default=None, help="prior: path to a trained vqvae_best.pt")
+    p.add_argument("--prior_dim", type=int, default=256, help="prior: transformer width")
+    p.add_argument("--prior_layers", type=int, default=6, help="prior: transformer layers")
+    p.add_argument("--prior_heads", type=int, default=8, help="prior: attention heads")
+    p.add_argument("--prior_dropout", type=float, default=0.1, help="prior: dropout (main defence against memorisation)")
+    p.add_argument("--temperature", type=float, default=1.0, help="prior: sampling temperature for the final sample grid")
+    p.add_argument("--top_k", type=int, default=0, help="prior: sample only from the k likeliest codes (0 = off)")
     p.add_argument("--n_recon", type=int, default=32, help="WGAN: real validation images reconstructed at each evaluation (test uses 4x)")
     p.add_argument("--recon_steps", type=int, default=150, help="WGAN: Adam steps of the latent search per image (test uses 2x)")
     p.add_argument("--vae_ref", type=float, default=None, help="WGAN: VAE baseline reconstruction SSIM, drawn on the plot")
@@ -299,6 +321,384 @@ def run_vae(args, loaders, shape, device):
           f"  -> saved {path}")
     print(f"Training curves: {plot_path}")
     print(f"Total training time: {fmt_time(time.perf_counter() - train_start)} for {args.epochs} epochs")
+
+
+# --------------------------------------------------------------- VQ-VAE
+def vq_loss(model, x, ssim_weight):
+    """Compute the VQ-VAE loss for one batch.
+
+        loss = L1 + ssim_weight * (1 - SSIM) + commitment
+
+    - L1 (mean absolute pixel error) keeps intensities right; it is less blurry than squared error.
+    - (1 - SSIM) optimises the structural similarity metric the project is judged on.
+    - The commitment term comes from the quantizer and keeps encoder outputs close to their codes.
+      (The codebook itself is updated by moving averages, so it needs no loss term.)
+
+    Args:
+        model: a VQVAE.
+        x: (B, C, H, W) images in [0, 1].
+        ssim_weight: weight on the (1 - SSIM) term.
+
+    Returns:
+        total: scalar tensor to backpropagate.
+        stats: dict of detached scalar tensors for logging: loss, ssim, mse, commit, perp.
+    """
+    recon, commit, _, perp = model(x)
+    s = ssim(recon, x).mean()
+    total = F.l1_loss(recon, x) + ssim_weight * (1 - s) + commit
+    stats = {"loss": total.detach(), "ssim": s.detach(), "mse": F.mse_loss(recon, x).detach(),
+             "commit": commit.detach(), "perp": perp.detach()}
+    return total, stats
+
+
+def plot_vqvae_history(history, path, target=0.6, ref=None, num_codes=512):
+    """Draw the VQ-VAE training curves as a 2x2 grid and save a PNG (rewritten every epoch).
+
+    Panels: total loss, reconstruction SSIM (with the 0.6 target and the VAE baseline), PSNR, and
+    codebook perplexity (effective number of codes in use, against the codebook size).
+    Train is blue and validation is orange; the orange dot marks the best epoch (the saved model).
+
+    Args:
+        history: dict of equal-length lists (see run_vqvae).
+        path: output PNG path.
+        target: SSIM target drawn as a dashed line.
+        ref: VAE baseline SSIM to draw as a dotted line, or None.
+        num_codes: codebook size, drawn as the ceiling of the perplexity panel.
+    """
+    ep = history["epoch"]
+    ssim_lines = [(target, f"target {target}", "--")] + ([(ref, "VAE baseline", ":")] if ref is not None else [])
+    panels = [
+        ("Total loss", "L1 + (1 \u2212 SSIM) + commitment", "loss", []),
+        ("Reconstruction SSIM", "SSIM", "ssim", ssim_lines),
+        ("PSNR (higher is better)", "dB", "psnr", []),
+        ("Codebook perplexity", "effective codes in use", "perp", [(num_codes, f"codebook size {num_codes}", ":")]),
+    ]
+    best_i = max(range(len(ep)), key=lambda i: history["val_ssim"][i])
+    fig, axes = plt.subplots(2, 2, figsize=(11, 7), facecolor=SURFACE)
+    for ax, (title, ylabel, key, hlines) in zip(axes.flat, panels):
+        ax.set_facecolor(SURFACE)
+        ax.plot(ep, history[f"train_{key}"], color=TRAIN_COLOR, lw=2, label="train")
+        ax.plot(ep, history[f"val_{key}"], color=VAL_COLOR, lw=2, label="validation")
+        ax.plot(ep[best_i], history[f"val_{key}"][best_i], "o", ms=8, mfc=VAL_COLOR, mec=SURFACE, mew=2,
+                zorder=3, label="best epoch (saved)")
+        for value, label, style in hlines:
+            ax.axhline(value, color=INK_2, lw=1.2, ls=style, label=label)
+        ax.set_title(title, loc="left", color=INK, fontsize=11)
+        ax.set_xlabel("epoch", color=INK_2, fontsize=9)
+        ax.set_ylabel(ylabel, color=INK_2, fontsize=9)
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+        ax.tick_params(colors=MUTED, labelsize=9, length=0)
+        ax.grid(axis="y", color=GRID, lw=0.8)
+        ax.set_axisbelow(True)
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+        for side in ("left", "bottom"):
+            ax.spines[side].set_color(AXIS)
+        if hlines:
+            ax.legend(frameon=False, fontsize=8, labelcolor=INK_2)
+    fig.legend(*axes[0, 0].get_legend_handles_labels(), loc="upper center", ncol=3, frameon=False,
+               labelcolor=INK_2, fontsize=10)
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
+    fig.savefig(path, dpi=150, facecolor=SURFACE)
+    plt.close(fig)
+
+
+def run_vqvae(args, loaders, shape, device):
+    """Train, validate, test and save a VQ-VAE, recording and plotting metrics.
+
+    Each epoch trains on the training set and scores the validation set with direct
+    reconstruction (encode -> quantize -> decode), which is exactly what the SSIM > 0.6 target
+    measures. The checkpoint with the highest validation SSIM is kept. At the end it is reloaded
+    and scored once on the test set, and codebook usage over the training set is counted.
+
+    Args:
+        args: parsed command-line arguments (see parse_args).
+        loaders: (train_loader, val_loader, test_loader) from get_dataloaders.
+        shape: (C, H, W) of one image.
+        device: torch.device to train on.
+
+    Saves (all in args.out):
+        vqvae_best.pt                     best checkpoint (weights, codebook and constructor config)
+        vqvae_history.json                per-epoch metrics, GPU memory and timing
+        vqvae_training_curves.png         the plot, refreshed after every epoch
+        vqvae_best_test_reconstructions.png  top: real test images, bottom: reconstructions
+    """
+    train_loader, val_loader, test_loader = loaders
+    C, H, W = shape
+    n_pixels = C * H * W
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+
+    cfg = dict(in_channels=C, img_size=(H, W), hidden=args.vq_hidden, num_codes=args.num_codes,
+               code_dim=args.code_dim, beta=args.commit)
+    model = VQVAE(**cfg).to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=args.lr or 2e-4)
+    print(f"VQ-VAE {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M params, "
+          f"code grid {model.grid[0]}x{model.grid[1]}, {args.num_codes} codes")
+
+    keys = ("loss", "ssim", "mse", "commit", "perp")
+
+    @torch.no_grad()
+    def evaluate(loader):
+        """Average of each metric over a loader (eval mode, so the codebook is not updated)."""
+        model.eval()
+        tot, n = dict.fromkeys(keys, 0.0), 0
+        for x in loader:
+            x = x.to(device)
+            _, st = vq_loss(model, x, args.ssim_weight)
+            for k in keys:
+                tot[k] += st[k].item() * x.size(0)
+            n += x.size(0)
+        return {k: v / n for k, v in tot.items()}
+
+    path = os.path.join(args.out, "vqvae_best.pt")
+    hist_path = os.path.join(args.out, "vqvae_history.json")
+    plot_path = os.path.join(args.out, "vqvae_training_curves.png")
+    history = {k: [] for k in ["epoch", "epoch_time_s", "elapsed_s"] +
+               [f"{sp}_{m}" for sp in ("train", "val") for m in ("loss", "ssim", "psnr", "perp", "commit")]}
+    best = -1.0
+    start = time.perf_counter()
+
+    for epoch in range(1, args.epochs + 1):
+        epoch_start = time.perf_counter()
+        model.train()                                         # evaluate() leaves the model in eval mode
+        tot, n_batches = dict.fromkeys(keys, 0.0), 0
+        for x in train_loader:
+            x = x.to(device, non_blocking=True)
+            loss, st = vq_loss(model, x, args.ssim_weight)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            for k in keys:
+                tot[k] += st[k].item()
+            n_batches += 1
+        tr = {k: v / n_batches for k, v in tot.items()}       # train metrics: running means over the epoch
+        va = evaluate(val_loader)
+        now = time.perf_counter()
+        epoch_time, elapsed = now - epoch_start, now - start
+        eta = elapsed / epoch * (args.epochs - epoch)
+
+        values = {"epoch": epoch, "epoch_time_s": epoch_time, "elapsed_s": elapsed}
+        for sp, d in (("train", tr), ("val", va)):
+            values.update({f"{sp}_loss": d["loss"], f"{sp}_ssim": d["ssim"], f"{sp}_perp": d["perp"],
+                           f"{sp}_commit": d["commit"], f"{sp}_psnr": psnr(d["mse"] * n_pixels, n_pixels)})
+        for k, v in values.items():
+            history[k].append(v)
+        print(f"epoch {epoch:3d} | train loss {tr['loss']:.4f} SSIM {tr['ssim']:.3f} | val loss {va['loss']:.4f} "
+              f"SSIM {va['ssim']:.3f} (target 0.6) PSNR {history['val_psnr'][-1]:.2f} dB | codes in use "
+              f"{va['perp']:.0f}/{args.num_codes} | {epoch_time:5.1f}s (elapsed {fmt_time(elapsed)}, ETA {fmt_time(eta)})")
+
+        if va["ssim"] > best:                                 # checkpoint first, so a plotting problem never costs the model
+            best = va["ssim"]
+            torch.save({"model": "vqvae", "config": cfg, "state_dict": model.state_dict(),
+                        "epoch": epoch, "val_ssim": va["ssim"]}, path)
+        try:
+            with open(hist_path, "w") as f:
+                json.dump({"args": vars(args), "history": history}, f, indent=2)
+            plot_vqvae_history(history, plot_path, ref=args.vae_ref, num_codes=args.num_codes)
+        except OSError as e:
+            print(f"  (could not write history/plot this epoch: {e}; will retry next time)")
+
+    # ---- final test with the best checkpoint
+    ck = torch.load(path, map_location=device)
+    model.load_state_dict(ck["state_dict"])
+    te = evaluate(test_loader)
+    model.eval()
+    used = torch.zeros(args.num_codes, dtype=torch.bool, device=device)   # codes the training images actually use
+    with torch.no_grad():
+        for x in train_loader:
+            used[model.encode_indices(x.to(device)).unique()] = True
+    test_x = torch.cat(list(test_loader))
+    sel = torch.linspace(0, len(test_x) - 1, 8).long()                    # spread over patients and slice levels
+    with torch.no_grad():
+        recon = model(test_x[sel].to(device))[0].cpu()
+    save_image(torch.cat([test_x[sel], recon]), os.path.join(args.out, "vqvae_best_test_reconstructions.png"), nrow=8)
+    total_time = time.perf_counter() - start
+    peak_mb = torch.cuda.max_memory_allocated() / 2 ** 20 if device.type == "cuda" else 0.0
+    print(f"TEST | best epoch {ck['epoch']} | SSIM {te['ssim']:.3f} (target 0.6) | PSNR "
+          f"{psnr(te['mse'] * n_pixels, n_pixels):.2f} dB | codes used by training images "
+          f"{int(used.sum())}/{args.num_codes} -> saved {path}")
+    print(f"Total training time: {fmt_time(total_time)} for {args.epochs} epochs | peak GPU memory {peak_mb:.0f} MB")
+    print(f"Training curves: {plot_path}")
+    try:                                                                  # keep the final numbers with the history
+        with open(hist_path, "w") as f:
+            json.dump({"args": vars(args), "history": history,
+                       "test": {**te, "psnr": psnr(te["mse"] * n_pixels, n_pixels), "codes_used": int(used.sum()),
+                                "best_epoch": ck["epoch"]},
+                       "profile": {"train_time_s": total_time, "peak_gpu_mb": peak_mb}}, f, indent=2)
+    except OSError as e:
+        print(f"  (could not write the final history: {e})")
+
+
+# ------------------------------------------------------------- code prior
+@torch.no_grad()
+def encode_all(vq, loader, device):
+    """Encode every image in a loader to its integer code grid. Returns (N, H/8, W/8) int16 on `device`."""
+    vq.eval()
+    return torch.cat([vq.encode_indices(x.to(device)).to(torch.int16).cpu() for x in loader]).to(device)
+
+
+def plot_prior_history(history, path, num_codes=512):
+    """Draw the prior's training curves (two panels) and save a PNG, rewritten every epoch.
+
+    Left: cross-entropy in nats per code (train blue, validation orange; the orange dot is the
+    best epoch, which is the saved model). Right: the same as perplexity, exp(cross-entropy), the
+    effective number of codes the model is choosing between at each position; the dotted line is
+    the codebook size, which a model that had learned nothing would score. A validation curve that
+    turns upward while training keeps falling means the prior has started memorising.
+    """
+    ep = history["epoch"]
+    best_i = min(range(len(ep)), key=lambda i: history["val_loss"][i])
+    panels = [("Cross-entropy", "nats per code", "loss", []),
+              ("Perplexity (effective choices per code)", "exp(cross-entropy)", "ppl", [(num_codes, f"codebook size {num_codes}")])]
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4), facecolor=SURFACE)
+    for ax, (title, ylabel, key, hlines) in zip(axes, panels):
+        ax.set_facecolor(SURFACE)
+        ax.plot(ep, history[f"train_{key}"], color=TRAIN_COLOR, lw=2, label="train")
+        ax.plot(ep, history[f"val_{key}"], color=VAL_COLOR, lw=2, label="validation")
+        ax.plot(ep[best_i], history[f"val_{key}"][best_i], "o", ms=8, mfc=VAL_COLOR, mec=SURFACE, mew=2,
+                zorder=3, label="best epoch (saved)")
+        for value, label in hlines:
+            ax.axhline(value, color=INK_2, lw=1.2, ls=":", label=label)
+        ax.set_title(title, loc="left", color=INK, fontsize=11)
+        ax.set_xlabel("epoch", color=INK_2, fontsize=9)
+        ax.set_ylabel(ylabel, color=INK_2, fontsize=9)
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+        ax.tick_params(colors=MUTED, labelsize=9, length=0)
+        ax.grid(axis="y", color=GRID, lw=0.8)
+        ax.set_axisbelow(True)
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+        for side in ("left", "bottom"):
+            ax.spines[side].set_color(AXIS)
+    axes[1].set_yscale("log")                                 # perplexity spans orders of magnitude
+    fig.legend(*axes[0].get_legend_handles_labels(), loc="upper center", ncol=3, frameon=False,
+               labelcolor=INK_2, fontsize=10)
+    fig.tight_layout(rect=(0, 0, 1, 0.92))
+    fig.savefig(path, dpi=150, facecolor=SURFACE)
+    plt.close(fig)
+
+
+def run_prior(args, loaders, shape, device):
+    """Train the autoregressive prior over a trained VQ-VAE's code grids, then draw samples.
+
+    The VQ-VAE (loaded from --vqvae and frozen) first turns every train, validation and test
+    image into a code grid. The prior learns to predict each code from the ones before it. The
+    checkpoint with the lowest validation cross-entropy is kept (validation images come from
+    different patients, so this is the guard against memorising the training grids). At the end it
+    is scored on the test set and a fixed, uncurated grid of 64 generated images is written.
+
+    Saves (all in args.out):
+        prior_best.pt              best checkpoint (weights, config and the VQ-VAE path it belongs to)
+        prior_history.json         per-epoch metrics, test score and generation speed
+        prior_training_curves.png  the plot, refreshed after every epoch
+        prior_samples.png          64 generated images (uncurated)
+    """
+    assert args.vqvae, "the prior needs a trained VQ-VAE: pass --vqvae path/to/vqvae_best.pt"
+    train_loader, val_loader, test_loader = loaders
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+
+    ck = torch.load(args.vqvae, map_location=device)
+    assert ck["model"] == "vqvae", f"{args.vqvae} is a '{ck['model']}' checkpoint, not a VQ-VAE"
+    vq = VQVAE(**ck["config"]).to(device)
+    vq.load_state_dict(ck["state_dict"])
+    vq.eval()
+    for p in vq.parameters():
+        p.requires_grad_(False)
+    codes = {name: encode_all(vq, ld, device)
+             for name, ld in (("train", train_loader), ("val", val_loader), ("test", test_loader))}
+    print(f"encoded code grids: " + ", ".join(f"{k} {tuple(v.shape)}" for k, v in codes.items()))
+
+    cfg = dict(num_codes=vq.num_codes, grid=vq.grid, dim=args.prior_dim, layers=args.prior_layers,
+               heads=args.prior_heads, dropout=args.prior_dropout)
+    prior = CodePrior(**cfg).to(device)
+    opt = torch.optim.AdamW(prior.parameters(), lr=args.lr or 3e-4, weight_decay=0.01)
+    print(f"prior {sum(p.numel() for p in prior.parameters()) / 1e6:.2f}M params, sequence length {prior.seq_len}")
+
+    @torch.no_grad()
+    def evaluate(name):
+        """Mean cross-entropy (nats per code) over one split, with dropout off."""
+        prior.eval()
+        grids, tot, n = codes[name], 0.0, 0
+        for i in range(0, len(grids), 64):
+            batch = grids[i:i + 64].long()
+            tot += prior.loss(batch).item() * len(batch)
+            n += len(batch)
+        return tot / n
+
+    path = os.path.join(args.out, "prior_best.pt")
+    hist_path = os.path.join(args.out, "prior_history.json")
+    plot_path = os.path.join(args.out, "prior_training_curves.png")
+    history = {k: [] for k in ("epoch", "train_loss", "val_loss", "train_ppl", "val_ppl", "epoch_time_s", "elapsed_s")}
+    best = float("inf")
+    start = time.perf_counter()
+    n_train = len(codes["train"])
+
+    for epoch in range(1, args.epochs + 1):
+        epoch_start = time.perf_counter()
+        prior.train()
+        perm = torch.randperm(n_train, device=device)
+        run, n_batches = 0.0, 0
+        for i in range(0, n_train - args.batch_size + 1, args.batch_size):
+            batch = codes["train"][perm[i:i + args.batch_size]].long()
+            loss = prior.loss(batch)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(prior.parameters(), 1.0)       # keeps rare large gradients from derailing training
+            opt.step()
+            run += loss.item(); n_batches += 1
+        tr, va = run / n_batches, evaluate("val")
+        now = time.perf_counter()
+        epoch_time, elapsed = now - epoch_start, now - start
+        eta = elapsed / epoch * (args.epochs - epoch)
+        for k, v in (("epoch", epoch), ("train_loss", tr), ("val_loss", va), ("train_ppl", math.exp(tr)),
+                     ("val_ppl", math.exp(va)), ("epoch_time_s", epoch_time), ("elapsed_s", elapsed)):
+            history[k].append(v)
+        print(f"epoch {epoch:3d} | train CE {tr:.3f} | val CE {va:.3f} (perplexity {math.exp(va):.1f} of "
+              f"{vq.num_codes}) | {epoch_time:5.1f}s (elapsed {fmt_time(elapsed)}, ETA {fmt_time(eta)})")
+
+        if va < best:                                          # checkpoint first, so a plotting problem never costs the model
+            best = va
+            torch.save({"model": "prior", "config": cfg, "state_dict": prior.state_dict(), "epoch": epoch,
+                        "val_loss": va, "vqvae": args.vqvae}, path)
+        try:
+            with open(hist_path, "w") as f:
+                json.dump({"args": vars(args), "history": history}, f, indent=2)
+            plot_prior_history(history, plot_path, vq.num_codes)
+        except OSError as e:
+            print(f"  (could not write history/plot this epoch: {e}; will retry next time)")
+
+    # ---- final test, and an uncurated sample grid from the best checkpoint
+    best_ck = torch.load(path, map_location=device)
+    prior.load_state_dict(best_ck["state_dict"])
+    test_ce = evaluate("test")
+    prior.eval()
+    torch.manual_seed(args.seed)                               # fixed seed: the same 64 images every time, no cherry-picking
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    grids = prior.sample(64, temperature=args.temperature, top_k=args.top_k or None)
+    images = vq.decode_indices(grids)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    gen_time = time.perf_counter() - t0
+    save_image(images.cpu(), os.path.join(args.out, "prior_samples.png"), nrow=8)
+    total_time = time.perf_counter() - start
+    peak_mb = torch.cuda.max_memory_allocated() / 2 ** 20 if device.type == "cuda" else 0.0
+    print(f"TEST | best epoch {best_ck['epoch']} | CE {test_ce:.3f} (perplexity {math.exp(test_ce):.1f}) "
+          f"-> saved {path}")
+    print(f"Generated 64 images in {gen_time:.1f}s ({64 / gen_time:.1f} images/s); samples: "
+          f"{os.path.join(args.out, 'prior_samples.png')}")
+    print(f"Total training time: {fmt_time(total_time)} for {args.epochs} epochs | peak GPU memory {peak_mb:.0f} MB")
+    try:
+        with open(hist_path, "w") as f:
+            json.dump({"args": vars(args), "history": history,
+                       "test": {"loss": test_ce, "ppl": math.exp(test_ce), "best_epoch": best_ck["epoch"]},
+                       "profile": {"train_time_s": total_time, "peak_gpu_mb": peak_mb,
+                                   "generate_64_s": gen_time}}, f, indent=2)
+    except OSError as e:
+        print(f"  (could not write the final history: {e})")
 
 # ----------------------------------------------------------- WGAN-GP helpers
 def ssim(x, y, win=7):
@@ -561,9 +961,15 @@ def run_wgan(args, loaders, shape, device):
     G, D = Generator(**g_cfg).to(device), Critic(**d_cfg).to(device)
     print(f"generator {sum(p.numel() for p in G.parameters()) / 1e6:.1f}M params, "
           f"critic {sum(p.numel() for p in D.parameters()) / 1e6:.1f}M params")
+    e_cfg = dict(in_channels=C, img_size=(H, W), z_dim=args.latent_dim, base=args.wgan_base)
+    E = Encoder(**e_cfg).to(device) if args.encoder else None          # None = pure WGAN-GP
+    if E is not None:
+        print(f"encoder {sum(p.numel() for p in E.parameters()) / 1e6:.1f}M params "
+              f"(reconstruction loss weight {args.lam_rec}, KL weight {args.lam_kl})")
 
     lr = args.lr or 1e-4
-    optG = torch.optim.Adam(G.parameters(), lr=lr, betas=(0.0, 0.9))   # betas from the WGAN-GP paper
+    g_params = list(G.parameters()) + (list(E.parameters()) if E is not None else [])   # encoder trains with the generator
+    optG = torch.optim.Adam(g_params, lr=lr, betas=(0.0, 0.9))         # betas from the WGAN-GP paper
     optD = torch.optim.Adam(D.parameters(), lr=lr, betas=(0.0, 0.9))
 
     Da = lambda x: D(translate(x, args.augment))      # the critic as it is trained and scored (augmented inputs)
@@ -578,6 +984,8 @@ def run_wgan(args, loaders, shape, device):
     test_x = torch.cat(list(test_loader)).to(device)
     val_targets = spread(val_x, args.n_recon)
     test_targets = spread(test_x, 4 * args.n_recon)
+    if E is not None:                                  # direct reconstruction is cheap: use every image
+        val_targets, test_targets = val_x, test_x
     data = infinite(train_loader)
 
     @torch.no_grad()
@@ -601,7 +1009,18 @@ def run_wgan(args, loaders, shape, device):
             tot += (Da(real).mean() - Da(G(z)).mean()).item() * real.size(0)
             n += real.size(0)
         fake = torch.cat([G.generate(min(32, args.n_eval - i)) for i in range(0, args.n_eval, 32)])
-        recon, score, z_rms = invert_images(G, targets, steps=steps, restarts=restarts)
+        if E is not None:                                  # direct reconstruction: G(mean of E(x)), no search
+            E.eval()
+            recon, zr = [], []
+            for i in range(0, len(targets), 64):
+                mu, _ = E(targets[i:i + 64] * 2 - 1)
+                recon.append((G(mu) + 1) / 2)
+                zr.append(mu.pow(2).mean(1).sqrt())
+            recon, z_rms = torch.cat(recon).clamp(0, 1), torch.cat(zr)
+            score = ssim(recon, targets)
+            E.train()
+        else:                                              # pure GAN: search for the best z per image
+            recon, score, z_rms = invert_images(G, targets, steps=steps, restarts=restarts)
         out = (tot / n, score.mean().item(), pairwise_ssim(fake), z_rms.mean().item(), recon)
         G.train()
         return out
@@ -609,6 +1028,7 @@ def run_wgan(args, loaders, shape, device):
     def save_ckpt(path, it, val_ssim):
         torch.save({"model": "wgan", "config": {"G": g_cfg, "D": d_cfg},
                     "G_state": G.state_dict(), "D_state": D.state_dict(),
+                    "E_state": E.state_dict() if E is not None else None, "E_config": e_cfg,
                     "iter": it, "val_ssim": val_ssim}, path)
 
     # Reference from REAL images: how alike two different real slices are (the diversity target).
@@ -620,9 +1040,13 @@ def run_wgan(args, loaders, shape, device):
     plot_path = os.path.join(args.out, "wgan_training_curves.png")
     history = {k: [] for k in ("iter", "elapsed_s", "train_d_loss", "train_g_loss", "train_w", "train_gp",
                                "val_w", "val_ssim", "div_ssim", "val_zrms")}
-    acc = {k: [] for k in ("d", "g", "w", "gp")}      # per-step values, averaged at each evaluation
+    acc = {k: [] for k in ("d", "g", "w", "gp") + (("rec", "kl") if E is not None else ())}   # per-step values, averaged at each evaluation
+    if E is not None:
+        history.update(train_rec=[], train_kl=[])
     best_ssim = -1.0
     G.train(); D.train()
+    if E is not None:
+        E.train()
     start = time.perf_counter()
 
     for it in range(1, args.iters + 1):
@@ -643,9 +1067,23 @@ def run_wgan(args, loaders, shape, device):
         # ---- generator: one update; the critic's weights are frozen so no wasted gradients
         D.requires_grad_(False)
         z = torch.randn(args.batch_size, args.latent_dim, device=device)
-        g_loss = -Da(G(z)).mean()
+        if E is None:
+            g_loss = -Da(G(z)).mean()
+            loss = g_loss
+        else:
+            x = next(data).to(device, non_blocking=True)                   # a real batch in [0, 1]
+            mu, logvar = E(x * 2 - 1)
+            z_e = mu + torch.randn_like(mu) * torch.exp(0.5 * logvar)      # sampled latent of the real images
+            out = G(torch.cat([z_e, z]))                                   # one pass, so BatchNorm statistics are shared
+            rec, fake = out[:len(x)], out[len(x):]                         # reconstructions and prior samples
+            rec01 = (rec + 1) / 2
+            rec_loss = (1 - ssim(rec01, x)).mean() + F.l1_loss(rec01, x)
+            kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())  # per latent dimension
+            g_loss = -0.5 * (Da(fake).mean() + Da(rec).mean())            # both should look real to the critic
+            loss = g_loss + args.lam_rec * rec_loss + args.lam_kl * kl
+            acc["rec"].append(rec_loss.detach()); acc["kl"].append(kl.detach())
         optG.zero_grad(set_to_none=True)
-        g_loss.backward()
+        loss.backward()
         optG.step()
         D.requires_grad_(True)
         acc["g"].append(g_loss.detach())
@@ -668,6 +1106,9 @@ def run_wgan(args, loaders, shape, device):
                   f"val {val_w:6.3f} | GP {m['gp']:.3f} | val recon SSIM {val_ssim:.3f} (target 0.6, z-rms {zrms:.2f}) "
                   f"| div {div:.3f} (real {ref['pair_ssim']:.3f}) "
                   f"| {fmt_time(elapsed)} ETA {fmt_time(eta)}")
+            if E is not None:
+                history["train_rec"].append(m["rec"]); history["train_kl"].append(m["kl"])
+                print(f"           encoder: reconstruction loss {m['rec']:.3f} (L1 + 1 - SSIM), KL/dim {m['kl']:.3f}")
 
             # Checkpoints first, so a plotting problem can never cost you a model
             save_ckpt(os.path.join(args.out, "wgan_last.pt"), it, val_ssim)
@@ -694,13 +1135,16 @@ def run_wgan(args, loaders, shape, device):
     # ---- final test with the best checkpoint (a stronger latent search than during training)
     ck = torch.load(os.path.join(args.out, "wgan_best.pt"), map_location=device)
     G.load_state_dict(ck["G_state"]); D.load_state_dict(ck["D_state"])
+    if E is not None:
+        E.load_state_dict(ck["E_state"])
     t_w, t_ssim, t_div, t_zrms, t_recon = evaluate(test_loader, test_targets, 2 * args.recon_steps, restarts=2)
     G.eval()
     with torch.no_grad():
         grid = torch.cat([G(fixed_z[k:k + 32]) for k in range(0, 64, 32)])
     save_image((grid + 1) / 2, os.path.join(args.out, "wgan_best_samples.png"), nrow=8)
     k = min(8, len(test_targets))
-    save_image(torch.cat([test_targets[:k], t_recon[:k]]),                 # top: real, bottom: reconstruction
+    sel = torch.linspace(0, len(test_targets) - 1, k).long()                # spread over patients and slice levels
+    save_image(torch.cat([test_targets[sel], t_recon[sel]]),                 # top: real, bottom: reconstruction
                os.path.join(args.out, "wgan_best_test_reconstructions.png"), nrow=k)
     print(f"TEST | best checkpoint: iteration {ck['iter']} | W {t_w:.3f} | reconstruction SSIM {t_ssim:.3f} "
           f"(target 0.6, z-rms {t_zrms:.2f}) | diversity {t_div:.3f}")
@@ -724,6 +1168,10 @@ def main():
 
     if args.model == "vae":
         run_vae(args, loaders, (C, H, W), device)
+    elif args.model == "vqvae":
+        run_vqvae(args, loaders, (C, H, W), device)
+    elif args.model == "prior":
+        run_prior(args, loaders, (C, H, W), device)
     else:
         run_wgan(args, loaders, (C, H, W), device)  # defined in the WGAN section
 
