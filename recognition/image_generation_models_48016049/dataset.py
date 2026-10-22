@@ -30,7 +30,7 @@ DATA_ROOT = "data"
 def to_channels(arr: np.ndarray, dtype=np.uint8) -> np.ndarray:
     """One-hot encode an integer label map into channels.
 
-    Intended for segmentation masks only (not needed for the VAE/WGAN, which
+    Intended for segmentation masks only (not needed for the VAE/VQ-VAE, which
     are trained on the images themselves).
 
     Args:
@@ -154,8 +154,7 @@ class SliceDataset(Dataset):
     Each image is min-max scaled to [0, 1] independently when the dataset is
     created, then stored as a float32 tensor. Scaling per image (not over the
     whole dataset) removes brightness differences between scans, and [0, 1]
-    matches the Sigmoid output of the VAE. For the WGAN, convert to [-1, 1] in
-    the training loop (x * 2 - 1) to match the Generator's tanh output.
+    matches the Sigmoid output of the VAE and VQ-VAE decoders.
 
     Indexing returns a tensor of shape (1, H, W), where the leading 1 is the
     channel axis. The DataLoader stacks these into (B, 1, H, W).

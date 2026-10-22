@@ -1,7 +1,12 @@
-"""VAE and WGAN-GP models for 256x128 single-channel hip MRI slices.
+"""Models for 256x128 single-channel hip MRI slices: a baseline VAE, a VQ-VAE and its code prior.
+
+    VAE        continuous latent vector; the baseline.
+    VQVAE      discrete latent grid of codebook indices; reconstructs images.
+    CodePrior  autoregressive transformer over the VQ-VAE's code grid; samples new grids,
+               which the VQ-VAE decoder turns into new images.
 
 Torch only (numpy is not allowed in this file).
-Images are expected in [0, 1] for the VAE.
+Images are expected in [0, 1].
 """
 import torch
 import torch.nn as nn
@@ -183,183 +188,6 @@ class VAE(nn.Module):
         z = torch.randn(n, self.latent_dim, device=device)
         return self.decode(z)
 
-
-# ============================================================== WGAN-GP
-# The Generator maps a noise vector to a 256x128 image; the Critic maps an image to a
-# single realism score. Both work through 6 scales of 2x resampling (256x128 <-> 4x2).
-
-_N_SCALES = 6  # number of 2x up/down-sampling steps
-
-
-def _scale_size(img_size):
-    """Return the (H, W) of the smallest feature map, 2**_N_SCALES times smaller than the image.
-
-    Args:
-        img_size: (H, W) of the images, e.g. (256, 128). Both must be divisible by 64.
-
-    Returns:
-        (H // 64, W // 64), e.g. (4, 2) for 256x128 images.
-    """
-    H, W = img_size
-    f = 2 ** _N_SCALES
-    assert H % f == 0 and W % f == 0, f"H and W must be divisible by {f}, got {img_size}"
-    return H // f, W // f
-
-
-def _init_weights(m):
-    """DCGAN-style initialisation: weights ~ N(0, 0.02), biases 0, BatchNorm scale ~ N(1, 0.02)."""
-    if isinstance(m, (nn.Conv2d, nn.Linear)):
-        nn.init.normal_(m.weight, 0.0, 0.02)
-        if m.bias is not None:
-            nn.init.zeros_(m.bias)
-    elif isinstance(m, nn.BatchNorm2d):
-        nn.init.normal_(m.weight, 1.0, 0.02)
-        nn.init.zeros_(m.bias)
-
-
-class _UpBlock(nn.Module):
-    """Generator block that doubles the spatial size: Upsample -> (Conv -> BatchNorm -> ReLU) x 2.
-
-    Nearest-neighbour upsampling followed by an ordinary convolution is used instead of a
-    transposed convolution, because it avoids the checkerboard artefacts that transposed
-    convolutions tend to leave in generated images.
-    """
-
-    def __init__(self, in_ch, out_ch):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode="nearest"),
-            nn.Conv2d(in_ch, out_ch, 3, 1, 1, bias=False), nn.BatchNorm2d(out_ch), nn.ReLU(),
-            nn.Conv2d(out_ch, out_ch, 3, 1, 1, bias=False), nn.BatchNorm2d(out_ch), nn.ReLU(),
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-
-class _DownBlock(nn.Module):
-    """Critic block that halves the spatial size: (Conv3x3 -> Norm -> LeakyReLU) then
-    (Conv4x4 stride 2 -> Norm -> LeakyReLU).
-
-    The normalisation is GroupNorm(1, C), which is layer normalisation over (C, H, W). It works
-    on each image separately, so it is safe with the gradient penalty (BatchNorm is not, since
-    it mixes information between the images in a batch).
-    """
-
-    def __init__(self, in_ch, out_ch):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 3, 1, 1), nn.GroupNorm(1, out_ch), nn.LeakyReLU(0.2),
-            nn.Conv2d(out_ch, out_ch, 4, 2, 1), nn.GroupNorm(1, out_ch), nn.LeakyReLU(0.2),
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-
-class Generator(nn.Module):
-    """Maps a latent vector z ~ N(0, I) to an image in [-1, 1] (Tanh output).
-
-    Shapes for the default 256x128 images (channels x height x width), base=64:
-        z                128
-        projection       512 x 4 x 2
-        after block 1    512 x 8 x 4
-        after block 2    256 x 16 x 8
-        after block 3    128 x 32 x 16
-        after block 4     64 x 64 x 32
-        after block 5     32 x 128 x 64
-        after block 6     32 x 256 x 128
-        output             1 x 256 x 128, values in [-1, 1]
-
-    Args:
-        z_dim: size of the latent vector.
-        out_channels: number of image channels (1 for greyscale MRI).
-        img_size: (H, W) of the output; both must be divisible by 64.
-        base: width multiplier. The widest layer has base * 8 channels. Use 64 for the full
-            model (about 8M parameters); smaller values train faster but give less detail.
-    """
-
-    def __init__(self, z_dim=128, out_channels=1, img_size=(256, 128), base=64):
-        super().__init__()
-        self.z_dim = z_dim
-        self.h0, self.w0 = _scale_size(img_size)
-        ch = [base * 8, base * 8, base * 4, base * 2, base, base // 2, base // 2]
-        assert len(ch) == _N_SCALES + 1
-        self.c0 = ch[0]
-
-        self.project = nn.Linear(z_dim, self.c0 * self.h0 * self.w0)    # z -> 512 x 4 x 2 feature map
-        self.project_norm = nn.Sequential(nn.BatchNorm2d(self.c0), nn.ReLU())
-        self.blocks = nn.Sequential(*[_UpBlock(ch[i], ch[i + 1]) for i in range(_N_SCALES)])
-        self.to_img = nn.Sequential(nn.Conv2d(ch[-1], out_channels, 3, 1, 1), nn.Tanh())
-        self.apply(_init_weights)
-
-    def forward(self, z):
-        """Generate images from latent vectors.
-
-        Args:
-            z: (B, z_dim) noise.
-
-        Returns:
-            (B, out_channels, H, W) images in [-1, 1].
-        """
-        x = self.project(z).view(-1, self.c0, self.h0, self.w0)
-        return self.to_img(self.blocks(self.project_norm(x)))
-
-    @torch.no_grad()
-    def generate(self, n):
-        """Generate n images from fresh noise, mapped back to [0, 1] for saving and evaluation.
-
-        Call model.eval() first so BatchNorm uses its running statistics.
-
-        Returns:
-            (n, out_channels, H, W) images in [0, 1], on the model's device.
-        """
-        z = torch.randn(n, self.z_dim, device=next(self.parameters()).device)
-        return (self(z) + 1) / 2
-
-
-class Critic(nn.Module):
-    """WGAN-GP critic: maps an image in [-1, 1] to one unbounded realism score.
-
-    The score is not a probability (no sigmoid): higher means "more like real data". Training
-    pushes real scores up and generated scores down, and the 1-Lipschitz constraint that
-    makes this a valid Wasserstein estimate is enforced by the gradient penalty in train.py.
-    The architecture's part in that is to avoid BatchNorm (see _DownBlock).
-
-    Shapes for the default 256x128 images, base=64:
-        input           1 x 256 x 128
-        after block 1   32 x 128 x 64
-        after block 2   64 x 64 x 32
-        after block 3  128 x 32 x 16
-        after block 4  256 x 16 x 8
-        after block 5  512 x 8 x 4
-        after block 6  512 x 4 x 2   -> flatten (4096) -> linear -> 1 score
-
-    Args:
-        in_channels: number of image channels.
-        img_size: (H, W) of the input; both must be divisible by 64.
-        base: width multiplier, as in Generator (about 14M parameters at 64).
-    """
-
-    def __init__(self, in_channels=1, img_size=(256, 128), base=64):
-        super().__init__()
-        h, w = _scale_size(img_size)
-        ch = [in_channels, base // 2, base, base * 2, base * 4, base * 8, base * 8]
-        assert len(ch) == _N_SCALES + 1
-        self.blocks = nn.Sequential(*[_DownBlock(ch[i], ch[i + 1]) for i in range(_N_SCALES)])
-        self.fc = nn.Linear(ch[-1] * h * w, 1)
-        self.apply(_init_weights)
-
-    def forward(self, x):
-        """Score a batch of images.
-
-        Args:
-            x: (B, C, H, W) images in [-1, 1].
-
-        Returns:
-            (B,) tensor of scores.
-        """
-        return self.fc(self.blocks(x).flatten(1)).view(-1)
 
 # ================================================================ VQ-VAE
 # An autoencoder whose bottleneck is DISCRETE: each cell of the encoder's feature map is
