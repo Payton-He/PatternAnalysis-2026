@@ -1,18 +1,27 @@
-"""Evaluate a trained VQ-VAE + prior and run inference on the test set.
+"""Evaluate a trained model on the test set: the baseline VAE, or the VQ-VAE + code prior.
 
-    python predict.py --vqvae models/vqvae_run1/vqvae_best.pt --prior models/prior_run1/prior_best.pt \
-                      --vae models/vae_best.pt --settings 1.0:0,0.8:50
+    python predict.py vae   --checkpoint models/vae_best.pt
+    python predict.py vae   --checkpoint models/vae_best.pt --reader_study 50
+    python predict.py vqvae --vqvae models/vqvae_run1/vqvae_best.pt --prior models/prior_run1/prior_best.pt \
+                            --vae models/vae_best.pt --settings 1.0:0,0.8:50
 
-Writes figures and metrics.json to results/<vqvae run name>/. Run from the project root so the
-relative data/ path used by dataset.py resolves. The shared helpers (SSIM, nearest neighbours, PCA,
-split-leakage check, reader study) are imported from predict_vae.py, the earlier VAE evaluation.
+Writes figures and metrics.json to results/<name>/ (the checkpoint name for `vae`, the VQ-VAE run
+folder name for `vqvae`). Run from the project root so the relative data/ path used by dataset.py
+resolves. Helpers used by both modes (SSIM, PCA, split-leakage check, reader study) are defined once.
 
-Checks performed:
+`vae` mode checks:
+    0. split leakage   - patient cases shared between train/validate/test
+    1. mode collapse   - diversity of generated vs real images, active latent dims
+    2. plausibility    - outlier ranking of generated images against real data
+    3. memorization    - nearest-neighbour distance to train vs test images
+    4. inference       - reconstructions of unseen test images, train/test gap
+
+`vqvae` mode checks:
     0. split leakage         - patient cases shared between train/validate/test
     1. reconstruction        - SSIM / PSNR of every test slice through encode -> quantize -> decode,
                                against the VAE baseline (this is the SSIM > 0.6 target)
     2. codebook health       - how many codes are used, and how evenly (the discrete mode-collapse check)
-    3. diversity             - pairwise SSIM of generated images against real ones, for each sampling setting
+    3. diversity             - pairwise SSIM of generated images against real ones, per sampling setting
     4. distribution fidelity - FID-style Frechet distance, precision and coverage in a PCA feature space
     5. plausibility          - outlier ranking of generated images; the worst ones are the failure autopsy
     6. memorization          - nearest training image (whole training set) for every generated image
@@ -24,6 +33,8 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")   # duplicate libiomp5md.d
 
 import argparse
 import json
+import random
+import re
 import time
 
 import matplotlib
@@ -31,13 +42,11 @@ matplotlib.use("Agg")                      # write figures to files; no window n
 import matplotlib.pyplot as plt
 import numpy as np                         # numpy is allowed here (not in modules.py)
 import torch
+import torch.nn.functional as F
 from torchvision.utils import save_image
 
-from dataset import get_dataloaders
-from modules import VQVAE, CodePrior
-from predict_vae import (collect, ssim, pairwise_ssim, pca_fit, pca_score, summarize,
-                         reader_study, check_split_leakage, load_vae, reconstruct as vae_reconstruct,
-                         generate as vae_generate)
+from dataset import get_dataloaders, get_file_list
+from modules import VAE, VQVAE, CodePrior
 
 
 # ------------------------------------------------------------- progress
@@ -55,7 +64,29 @@ def free_gpu():
         torch.cuda.empty_cache()
 
 
+
 # ------------------------------------------------------------- loading
+def load_vae(path, device):
+    """Rebuild a VAE from a checkpoint written by train.py and put it in eval mode.
+
+    The checkpoint stores the constructor settings, so no command-line
+    arguments are needed to recreate the same architecture.
+
+    Args:
+        path: path to vae_best.pt.
+        device: torch.device to load onto.
+
+    Returns:
+        The VAE, in eval mode (BatchNorm uses its running statistics).
+    """
+    ck = torch.load(path, map_location=device)
+    assert ck["model"] == "vae", f"{path} is a '{ck['model']}' checkpoint, not a VAE"
+    model = VAE(**ck["config"]).to(device)
+    model.load_state_dict(ck["state_dict"])
+    print(f"loaded {path} (epoch {ck['epoch']}, val loss {ck['val_loss']:.2f})")
+    return model.eval()
+
+
 def load_vqvae(path, device):
     """Rebuild a VQ-VAE from a checkpoint written by train.py and put it in eval mode."""
     ck = torch.load(path, map_location=device)
@@ -88,6 +119,179 @@ def read_json(path):
             return json.load(f)
     except OSError:
         return {}
+
+
+
+def collect(loader, max_n, seed=0):
+    """Gather a loader's images into one (N, 1, H, W) CPU tensor, randomly capped at max_n.
+
+    Args:
+        loader: a DataLoader yielding (B, 1, H, W) batches.
+        max_n: maximum number of images to keep.
+        seed: seed for the random subset, so reruns use the same images.
+    """
+    x = torch.cat([b for b in loader])
+    if len(x) > max_n:
+        g = torch.Generator().manual_seed(seed)
+        x = x[torch.randperm(len(x), generator=g)[:max_n]]
+    return x
+
+
+# ------------------------------------------------- metrics shared by both modes
+def ssim(x, y, win=7):
+    """Structural similarity for each image pair in two (B, 1, H, W) batches in [0, 1].
+
+    Uses a uniform window (a simple version of SSIM). 1 = identical, 0 = unrelated.
+
+    Returns:
+        (B,) tensor with one SSIM value per pair.
+    """
+    c1, c2, p = 0.01 ** 2, 0.03 ** 2, win // 2
+    pool = lambda t: F.avg_pool2d(t, win, 1, p, count_include_pad=False)
+    mx, my = pool(x), pool(y)
+    sxx, syy, sxy = pool(x * x) - mx ** 2, pool(y * y) - my ** 2, pool(x * y) - mx * my
+    s = ((2 * mx * my + c1) * (2 * sxy + c2)) / ((mx ** 2 + my ** 2 + c1) * (sxx + syy + c2))
+    return s.flatten(1).mean(1)
+
+
+def pairwise_ssim(x, n_pairs=2000, seed=0):
+    """Mean SSIM between randomly chosen pairs of different images in x.
+
+    A diversity measure: high = images look alike, low = images vary.
+    """
+    g = torch.Generator().manual_seed(seed)
+    i = torch.randint(0, len(x), (n_pairs,), generator=g)
+    j = torch.randint(0, len(x), (n_pairs,), generator=g)
+    keep = i != j
+    return ssim(x[i[keep]], x[j[keep]]).mean().item()
+
+
+
+def pca_fit(x, k=50):
+    """Fit PCA to real images. Returns (mean, top-k components, variance of each component)."""
+    X = x.flatten(1).numpy().astype(np.float32)
+    mean = X.mean(0)
+    _, S, Vt = np.linalg.svd(X - mean, full_matrices=False)
+    k = min(k, len(S))
+    return mean, Vt[:k], (S[:k] ** 2) / max(len(X) - 1, 1) + 1e-8
+
+
+def pca_score(x, pca):
+    """Mahalanobis distance of each image in PCA space (large = unusual compared with real data)."""
+    mean, V, var = pca
+    p = (x.flatten(1).numpy() - mean) @ V.T
+    return ((p ** 2) / var).sum(1)
+
+
+def summarize(a):
+    """Mean, median and 95th percentile of an array, as plain floats for JSON."""
+    a = np.asarray(a, dtype=np.float64)
+    return {"mean": float(a.mean()), "median": float(np.median(a)), "p95": float(np.percentile(a, 95))}
+
+
+# ------------------------------------------------------------- other checks
+def check_split_leakage():
+    """Return the case IDs that appear in more than one split (all three lists should be empty)."""
+    def cases(split):
+        return {m.group(1) for f in get_file_list(f"keras_slices_{split}")
+                if (m := re.search(r"case_(\d+)", f))}
+    tr, va, te = cases("train"), cases("validate"), cases("test")
+    return {"train&validate": sorted(tr & va), "train&test": sorted(tr & te), "validate&test": sorted(va & te)}
+
+
+def reader_study(real, fake, n, out_dir, seed=0):
+    """Export n real and n generated slices as shuffled, anonymised PNGs plus an answer key (key.csv)."""
+    os.makedirs(out_dir, exist_ok=True)
+    rng = random.Random(seed)
+    items = [("real", real[i]) for i in rng.sample(range(len(real)), min(n, len(real)))]
+    items += [("fake", fake[i]) for i in rng.sample(range(len(fake)), min(n, len(fake)))]
+    rng.shuffle(items)
+    with open(os.path.join(out_dir, "key.csv"), "w") as f:
+        f.write("file,label\n")
+        for k, (label, img) in enumerate(items):
+            name = f"{k:03d}.png"
+            plt.imsave(os.path.join(out_dir, name), img[0].numpy(), cmap="gray", vmin=0, vmax=1)
+            f.write(f"{name},{label}\n")
+
+
+# ------------------------------------------------------------ VAE helpers
+@torch.no_grad()
+def generate_vae(model, n, bs=64):
+    """Generate n images by decoding z ~ N(0, I). Returns a (n, 1, H, W) CPU tensor in [0, 1]."""
+    return torch.cat([model.sample(min(bs, n - i)).cpu() for i in range(0, n, bs)])
+
+
+def nn_distance(query, ref, bs=128):
+    """Distance from each query image to its closest reference image (pixel space).
+
+    Args:
+        query: (N, 1, H, W) tensor.
+        ref: (M, 1, H, W) tensor.
+
+    Returns:
+        dists: (N,) Euclidean distance to the nearest reference image.
+        idxs: (N,) index into `ref` of that nearest image.
+    """
+    q, r = query.flatten(1), ref.flatten(1)
+    dists, idxs = [], []
+    for i in range(0, len(q), bs):
+        m = torch.cdist(q[i:i + bs], r).min(1)
+        dists.append(m.values); idxs.append(m.indices)
+    return torch.cat(dists), torch.cat(idxs)
+
+
+@torch.no_grad()
+def reconstruct_vae(model, x, device, bs=128):
+    """Deterministic reconstruction: decode the encoder's mean (no random sampling)."""
+    out = []
+    for i in range(0, len(x), bs):
+        mu, _ = model.encode(x[i:i + bs].to(device))
+        out.append(model.decode(mu).cpu())
+    return torch.cat(out)
+
+
+def recon_stats(model, x, device):
+    """Mean squared error per pixel and mean SSIM between images and their reconstructions."""
+    r = reconstruct_vae(model, x, device)
+    return ((r - x) ** 2).mean().item(), ssim(r, x).mean().item()
+
+
+@torch.no_grad()
+def kl_per_dim(model, x, device, bs=128):
+    """Average KL divergence of each latent dimension over a set of images. Returns (latent_dim,)."""
+    mus, lvs = [], []
+    for i in range(0, len(x), bs):
+        mu, lv = model.encode(x[i:i + bs].to(device))
+        mus.append(mu.cpu()); lvs.append(lv.cpu())
+    mu, lv = torch.cat(mus), torch.cat(lvs)
+    return (-0.5 * (1 + lv - mu.pow(2) - lv.exp())).mean(0)
+
+
+@torch.no_grad()
+def interpolation_grid(model, device, rows=8, steps=8):
+    """Decode straight-line paths between random latent points. Returns (rows*steps, 1, H, W)."""
+    z0 = torch.randn(rows, model.latent_dim)
+    z1 = torch.randn(rows, model.latent_dim)
+    t = torch.linspace(0, 1, steps)
+    z = z0[:, None] * (1 - t)[None, :, None] + z1[:, None] * t[None, :, None]   # (rows, steps, D)
+    return model.decode(z.reshape(-1, model.latent_dim).to(device)).cpu()
+
+
+def plot_kl_per_dim(kl, path):
+    """Bar chart of per-dimension KL, sorted high to low. Bars near zero are unused ('collapsed') dimensions."""
+    kl = np.sort(kl.numpy())[::-1]
+    fig, ax = plt.subplots(figsize=(8, 3.5), facecolor="#fcfcfb")
+    ax.set_facecolor("#fcfcfb")
+    ax.bar(range(len(kl)), kl, color="#2a78d6", width=0.8)
+    ax.axhline(0.01, color="#898781", lw=1, ls="--")          # threshold used for "active"
+    ax.set_xlabel("latent dimension (sorted)", color="#52514e")
+    ax.set_ylabel("mean KL (nats)", color="#52514e")
+    ax.set_title("Information carried by each latent dimension", loc="left", color="#0b0b0b", fontsize=11)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150, facecolor="#fcfcfb")
+    plt.close(fig)
 
 
 # ------------------------------------------------------- VQ-VAE helpers
@@ -258,24 +462,99 @@ def plot_ssim_hist(scores, path, target=0.6, baseline=None):
     plt.close(fig)
 
 
-# ---------------------------------------------------------------- main
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--vqvae", required=True, help="path to vqvae_best.pt")
-    ap.add_argument("--prior", required=True, help="path to prior_best.pt")
-    ap.add_argument("--vae", default=None, help="optional path to vae_best.pt, the baseline to compare against")
-    ap.add_argument("--settings", default="1.0:0,0.8:50",
-                    help="comma-separated temperature:top_k sampling settings to evaluate (top_k 0 = off)")
-    ap.add_argument("--n_samples", type=int, default=256, help="images generated per setting (about 3 images/s)")
-    ap.add_argument("--max_real", type=int, default=2000, help="cap on real images used for PCA and diversity")
-    ap.add_argument("--batch_size", type=int, default=32)
-    ap.add_argument("--reader_study", type=int, default=0, help="export N real + N fake blinded PNGs (first setting)")
-    ap.add_argument("--out", default="results")
-    ap.add_argument("--seed", type=int, default=0)
-    args = ap.parse_args()
+# ----------------------------------------------------------- VAE evaluation
+def evaluate_vae(args, device):
+    """Evaluate the baseline VAE given by --checkpoint.
 
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    Writes samples.png, interpolation.png, kl_per_dim.png, worst_generated.png, closest_to_train.png,
+    test_reconstructions.png and metrics.json to results/<checkpoint name>/.
+    """
+    out = os.path.join(args.out, os.path.splitext(os.path.basename(args.checkpoint))[0])
+    os.makedirs(out, exist_ok=True)
+
+    model = load_vae(args.checkpoint, device)
+    train_loader, _, test_loader = get_dataloaders(batch_size=args.batch_size)
+    train_x = collect(train_loader, args.max_real, args.seed)
+    test_x = collect(test_loader, args.max_real, args.seed)
+    fake = generate_vae(model, args.n_samples)
+    print(f"train {tuple(train_x.shape)}, test {tuple(test_x.shape)}, generated {tuple(fake.shape)}")
+
+    metrics = {"model": "vae", "checkpoint": args.checkpoint}
+    save_image(fake[:64], os.path.join(out, "samples.png"), nrow=8)
+    save_image(interpolation_grid(model, device), os.path.join(out, "interpolation.png"), nrow=8)
+
+    # 0. split leakage
+    metrics["split_overlap_by_case"] = check_split_leakage()
+
+    # 1. mode collapse
+    kl = kl_per_dim(model, test_x, device)
+    plot_kl_per_dim(kl, os.path.join(out, "kl_per_dim.png"))
+    metrics["mode_collapse"] = {
+        "pairwise_ssim_real": pairwise_ssim(test_x, seed=args.seed),
+        "pairwise_ssim_generated": pairwise_ssim(fake, seed=args.seed),
+        "active_latent_dims": f"{int((kl > 0.01).sum())}/{kl.numel()}",
+        "note": "generated SSIM far above real = low diversity; few active dims = posterior collapse",
+    }
+    # Reconstructions are as blurry as samples but as varied as real data, so this is the fair baseline
+    recon_test = reconstruct_vae(model, test_x, device)
+    metrics["mode_collapse"]["pairwise_ssim_reconstructions"] = pairwise_ssim(recon_test, seed=args.seed)
+
+    # 2. anatomical plausibility: outlier ranking against the real training distribution
+    pca = pca_fit(train_x)
+    s_test, s_fake = pca_score(test_x, pca), pca_score(fake, pca)
+    metrics["plausibility"] = {
+        "mahalanobis_real_test": summarize(s_test),
+        "mahalanobis_generated": summarize(s_fake),
+        "frac_generated_above_real_p99": float((s_fake > np.percentile(s_test, 99)).mean()),
+        "note": "outlier ranking only; inspect worst_generated.png and use a reader study for real evidence",
+    }
+    worst = torch.from_numpy(np.argsort(-s_fake)[:16].copy())
+    save_image(fake[worst], os.path.join(out, "worst_generated.png"), nrow=8)
+
+    # 3. memorization: nearest neighbour in train vs test (equal-sized reference sets)
+    n = min(len(train_x), len(test_x), len(fake))
+    d_train, idx_train = nn_distance(fake[:n], train_x[:n])
+    d_test, _ = nn_distance(fake[:n], test_x[:n])
+    d_base, _ = nn_distance(test_x[:n], train_x[:n])      # how close real test images are to train
+    metrics["memorization"] = {
+        "nn_dist_generated_to_train": summarize(d_train.numpy()),
+        "nn_dist_generated_to_test": summarize(d_test.numpy()),
+        "nn_dist_test_to_train_baseline": summarize(d_base.numpy()),
+        "ratio_gen_train_over_gen_test": float(d_train.mean() / d_test.mean()),
+        "note": "ratio clearly below 1 suggests copying of training data",
+    }
+    closest = torch.argsort(d_train)[:16]
+    save_image(torch.cat([fake[closest], train_x[:n][idx_train[closest]]], dim=3),   # fake | nearest train
+               os.path.join(out, "closest_to_train.png"), nrow=4)
+
+    # 4. inference on unseen test images + overfitting check
+    tr_mse, tr_ssim = recon_stats(model, train_x, device)
+    te_mse, te_ssim = recon_stats(model, test_x, device)
+    metrics["inference"] = {
+        "recon_mse_per_pixel_train": tr_mse, "recon_mse_per_pixel_test": te_mse,
+        "recon_ssim_train": tr_ssim, "recon_ssim_test": te_ssim,
+        "recon_psnr_test_db": float(10 * np.log10(1 / te_mse)),
+        "note": "a large train/test gap indicates overfitting",
+    }
+    k = min(8, len(test_x))
+    save_image(torch.cat([test_x[:k], reconstruct_vae(model, test_x[:k], device)]),      # top: real, bottom: reconstruction
+               os.path.join(out, "test_reconstructions.png"), nrow=k)
+
+    if args.reader_study > 0:
+        reader_study(test_x, fake, args.reader_study, os.path.join(out, "reader_study"), args.seed)
+
+    with open(os.path.join(out, "metrics.json"), "w") as f:
+        json.dump(metrics, f, indent=2)
+    print(json.dumps(metrics, indent=2))
+    print(f"\nFigures and metrics saved to {out}/")
+
+
+# -------------------------------------------------------- VQ-VAE evaluation
+def evaluate_vqvae(args, device):
+    """Evaluate the VQ-VAE + code prior given by --vqvae and --prior (checks 0-8 in the module docstring).
+
+    Writes the figures and metrics.json to results/<VQ-VAE run folder name>/.
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
@@ -317,7 +596,7 @@ def main():
     }
     vae_ssim = None
     if vae is not None:
-        vr = vae_reconstruct(vae, test_x, device)
+        vr = reconstruct_vae(vae, test_x, device)
         vae_ssim = ssim(vr, test_x).mean().item()
         metrics["reconstruction"]["vae_baseline_ssim_test_mean"] = vae_ssim
         metrics["reconstruction"]["vae_baseline_psnr_test_db"] = psnr_db(vr, test_x)
@@ -456,7 +735,7 @@ def main():
     log("VAE baseline samples")
     # baseline: VAE samples scored the same way
     if vae is not None:
-        vfake = vae_generate(vae, args.n_samples)
+        vfake = generate_vae(vae, args.n_samples)
         vf = pca_project(vfake, pca)
         save_image(vfake[:64], os.path.join(out, "vae_samples.png"), nrow=8)
         metrics["vae_baseline_samples"] = {
@@ -488,6 +767,42 @@ def main():
         json.dump(metrics, f, indent=2)
     print("\n" + json.dumps(metrics, indent=2))
     print(f"\nFigures and metrics saved to {out}/")
+
+
+# ---------------------------------------------------------------- main
+def main():
+    """Parse arguments, seed everything and run the evaluation for the chosen mode."""
+    ap = argparse.ArgumentParser()
+    ap.add_argument("model", choices=["vae", "vqvae"], help="which model to evaluate")
+    ap.add_argument("--checkpoint", default=None, help="vae mode: path to vae_best.pt")
+    ap.add_argument("--vqvae", default=None, help="vqvae mode: path to vqvae_best.pt")
+    ap.add_argument("--prior", default=None, help="vqvae mode: path to prior_best.pt")
+    ap.add_argument("--vae", default=None, help="vqvae mode: optional path to vae_best.pt, the baseline to compare against")
+    ap.add_argument("--settings", default="1.0:0,0.8:50",
+                    help="vqvae mode: comma-separated temperature:top_k sampling settings (top_k 0 = off)")
+    ap.add_argument("--n_samples", type=int, default=None,
+                    help="images generated (default 2000 for vae; 256 per setting for vqvae, about 3 images/s)")
+    ap.add_argument("--max_real", type=int, default=2000, help="cap on real images used for PCA and diversity")
+    ap.add_argument("--batch_size", type=int, default=32)
+    ap.add_argument("--reader_study", type=int, default=0, help="export N real + N fake blinded PNGs")
+    ap.add_argument("--out", default="results")
+    ap.add_argument("--seed", type=int, default=0)
+    args = ap.parse_args()
+
+    if args.model == "vae":
+        assert args.checkpoint, "vae mode needs --checkpoint path/to/vae_best.pt"
+    else:
+        assert args.vqvae and args.prior, "vqvae mode needs --vqvae and --prior"
+    if args.n_samples is None:
+        args.n_samples = 2000 if args.model == "vae" else 256
+
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.model == "vae":
+        evaluate_vae(args, device)
+    else:
+        evaluate_vqvae(args, device)
 
 
 if __name__ == "__main__":
