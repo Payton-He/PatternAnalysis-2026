@@ -40,7 +40,7 @@ import time
 import matplotlib
 matplotlib.use("Agg")                      # write figures to files; no window needed
 import matplotlib.pyplot as plt
-import numpy as np                         # numpy is allowed here (not in modules.py)
+import numpy as np                        
 import torch
 import torch.nn.functional as F
 from torchvision.utils import save_image

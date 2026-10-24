@@ -4,8 +4,7 @@
     VQVAE      discrete latent grid of codebook indices; reconstructs images.
     CodePrior  autoregressive transformer over the VQ-VAE's code grid; samples new grids,
                which the VQ-VAE decoder turns into new images.
-
-Torch only (numpy is not allowed in this file).
+               
 Images are expected in [0, 1].
 """
 import torch
