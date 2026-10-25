@@ -1,6 +1,6 @@
 # Synthetic Hip-MRI Slices with a VQ-VAE and an Autoregressive Code Prior
 
-![Reconstructions](images/result_final/final_vqvae/test_reconstructions.png)
+![Reconstructions](images/results_final/final_vqvae/test_reconstructions.png)
 *Top row: real test slices. Bottom row: their VQ-VAE reconstructions (test SSIM 0.856 over all 540 test slices).*
 
 ---
@@ -164,10 +164,6 @@ or a newly sampled grid decoded to a `(1, 256, 128)` image.
 | Generated image next to its closest training scan | `images/results_final/final_vqvae/closest_to_train_T1.0_k0.png` |
 | VAE samples | `images/results_final/final_vqvae/vae_samples.png` |
 
-![Training curves](images/training_curve/vqvae_training_curves.png)
-![Uncurated samples](images/results_final/final_vqvae/samples_T1.0_k0.png)
-![Interpolation](images/results_final/final_vqvae/interpolation_T1.0_k0.png)
-
 ---
 
 ## 6. Investigation of the Open Research Dilemma
@@ -263,7 +259,10 @@ The 16 most outlying generated images at T=1.0 (seed 0) are in `worst_generated_
 so a flagged image only counts as a failure if it is clearly worse than real outliers. Only 2.3 % (seed 0) to 4.7 % (seed 1) of T=1.0 samples exceed the real 99th-percentile score.
 
 ![Worst generated](images/results_final/final_vqvae/worst_generated_T1.0_k0.png)
+*Worst Generated Images*
+
 ![Worst real (control)](images/results_final/final_vqvae/worst_real_test.png)
+*Worst Real Images (Control)*
 
 **Control: what real outliers look like.** All 16 most outlying real test slices still show organised pelvic anatomy: a bright subcutaneous fat rim, layered muscle,
 a bright oval structure towards the top in several, round or ring-shaped structures along the midline, and left-right symmetry. They score as outliers because of
@@ -288,13 +287,19 @@ The other 12 images in the figure fall into similar families: no organ layout, a
 These causes are hypotheses from looking at the images and from the metrics below. I did not instrument the model to log where in the 512-token scan each sample first goes wrong.
 
 **What the uncurated grid shows** (`samples_T1.0_k0.png`: the first 64 samples, T=1.0, fixed seed, no selection).
+
 ![Uncurated samples](images/results_final/final_vqvae/samples_T1.0_k0.png)
+*Uncurated samples*
+
 - Most samples have a well-formed body outline and a bright rim along the top or bottom edge (at least two of the worst 16 lack it), but the interior is generally dark with sharp-edged, polygon-like compartments.
   Next to the real slices in `worst_real_test.png` the generated texture looks **stylised and low in fine detail**; I expect most samples would be recognisable as synthetic on sight.
 - In my rough count, **about 33 of 64 samples contain a bright, smooth oval** of varying size at a similar mid-image position; the rest do not. This is a hand count with some judgement involved, so treat it as accurate to within a few images.
 - The random **real** grid shows the same thing: roughly 35-40 of 64 real training slices contain a bright oval (most likely the bladder, at the slice levels where it appears), so the oval is a genuine feature at about the right frequency, not an over-represented motif.
   The oval's absence from the other samples is therefore not a failure in itself.
+
 ![Random real training slices](images/results_final/final_vqvae/real_train_random64.png)
+*Random real training slices*
+
 - What the real slices have and the generated ones lack: clear ring-shaped structures on both sides of the pelvis (apparently the femoral heads), strong left-right symmetry, distinct bone and muscle boundaries, and fine texture.
   The generated samples reproduce the overall layout (outline, a bladder-like oval, dark muscle-like regions) but not these details. Real slices also vary more in contrast and appearance between slice levels, whereas generated samples share a common dark, compartmentalised look. (My reading of the two grids, not a measured quantity.)
 - So the quantitative metrics describe the samples more favourably than a direct look does. The metrics measure distance in a 50-component PCA space, which is dominated by coarse brightness layout, not by fine anatomical detail.
@@ -334,6 +339,7 @@ Together the two raters were right on 103 of 128 labels (80.5 %). Chance is 50 %
 - Caveats: two raters, neither a clinician; Rater A is the author and had seen generated images before (above); the raters labelled the same 64 images, so their results are not independent samples of images;
   the real images come from only the 3 test patients; it is one draw of 32 + 32 images; and the raters knew the mix was half real, half generated.
 - Three generated images (047.png, 020.png and 026.png in the study; the key confirms all three are generated and both raters identified them correctly) that the raters found obviously synthetic: a bright, featureless region with horizontal bands (left), layered folds with no organs (middle), and sweeping high-contrast bands (right).
+
   ![Generated example 1](images/results_final/reader_study_examples/example_1.png) ![Generated example 2](images/results_final/reader_study_examples/example_2.png) ![Generated example 3](images/results_final/reader_study_examples/example_3.png)
 
 The study images, and the key (contains the answer and both raters' guesses) are in `images/results_final/reader_study`
