@@ -1,0 +1,220 @@
+{
+  "model": "vqvae+prior",
+  "vqvae": "models/final_vqvae/vqvae_best.pt",
+  "prior": "models/final_prior/prior_best.pt",
+  "vae": "models/final_vae/vae_best.pt",
+  "split_overlap_by_case": {
+    "train&validate": [],
+    "train&test": [],
+    "validate&test": []
+  },
+  "reconstruction": {
+    "ssim_test_mean": 0.8563510179519653,
+    "ssim_test_summary": {
+      "mean": 0.8563510097839214,
+      "median": 0.8575925827026367,
+      "p95": 0.8924869686365128
+    },
+    "ssim_test_min": 0.8025980591773987,
+    "fraction_test_above_0.6": 1.0,
+    "ssim_train_mean": 0.8403024077415466,
+    "psnr_test_db": 27.232481129399805,
+    "note": "SSIM uses a uniform 7x7 window; each test slice is compared with its own reconstruction",
+    "vae_baseline_ssim_test_mean": 0.491117924451828,
+    "vae_baseline_psnr_test_db": 20.49686481214963
+  },
+  "codebook": {
+    "codes_used_by_training_images": "512/512",
+    "perplexity_training_images": 416.76652648160535,
+    "most_used_code_share": 0.021974885061885534,
+    "note": "perplexity near the codebook size = all codes used evenly; a low value signals codebook collapse"
+  },
+  "settings": {
+    "T1.0_k0": {
+      "temperature": 1.0,
+      "top_k": 0,
+      "images_per_second": 2.850493248125865,
+      "diversity": {
+        "pairwise_ssim_real_test": 0.247596874833107,
+        "pairwise_ssim_generated": 0.23657673597335815,
+        "pairwise_ssim_reconstructions": 0.2751472592353821,
+        "distinct_codes_in_samples": "512/512",
+        "note": "generated far above real = low diversity; temperature below 1 lowers diversity"
+      },
+      "distribution": {
+        "frechet_pca": 47.19651147040713,
+        "precision": 0.94921875,
+        "coverage": 0.8159999847412109,
+        "floor_other_real_training_slices": {
+          "frechet_pca": 21.32246080595428,
+          "precision": 0.96484375,
+          "coverage": 0.8579999804496765
+        },
+        "baseline_real_test_as_generated": {
+          "frechet_pca": 169.7920591108831,
+          "precision": 0.88671875,
+          "coverage": 0.2919999957084656
+        },
+        "note": "PCA-50 features, not Inception; reference = random training slices. floor = other real training slices (best a generator can do); baseline = real unseen patients (differs from training by patient)"
+      },
+      "plausibility": {
+        "mahalanobis_real_test": {
+          "mean": 36.441477588370994,
+          "median": 33.718833923339844,
+          "p95": 59.31417961120605
+        },
+        "mahalanobis_generated": {
+          "mean": 35.77771044149995,
+          "median": 31.66186237335205,
+          "p95": 60.29631519317627
+        },
+        "frac_generated_above_real_p99": 0.0234375,
+        "note": "outlier ranking only; inspect worst_generated_*.png (the failure autopsy) by eye",
+        "worst_generated_indices": [
+          211,
+          90,
+          228,
+          119,
+          1,
+          198,
+          216,
+          52,
+          177,
+          95,
+          178,
+          27,
+          114,
+          118,
+          184,
+          89
+        ]
+      },
+      "memorization": {
+        "nn_dist_generated_to_train": {
+          "mean": 25.856721192598343,
+          "median": 25.122031211853027,
+          "p95": 32.59906578063965
+        },
+        "ratio_gen_train_over_gen_test_equal_sized_refs": 0.9117007255554199,
+        "nn_ssim_generated_to_train": {
+          "mean": 0.3506135903298855,
+          "median": 0.3495854437351227,
+          "p95": 0.4352617859840393
+        },
+        "frac_generated_with_nn_ssim_above_0.6": 0.0,
+        "note": "ratio clearly below 1, or many pairs above SSIM 0.6, suggests copying; compare with the test baseline"
+      }
+    },
+    "T0.8_k50": {
+      "temperature": 0.8,
+      "top_k": 50,
+      "images_per_second": 2.8457202788655214,
+      "diversity": {
+        "pairwise_ssim_real_test": 0.247596874833107,
+        "pairwise_ssim_generated": 0.28882768750190735,
+        "pairwise_ssim_reconstructions": 0.2751472592353821,
+        "distinct_codes_in_samples": "512/512",
+        "note": "generated far above real = low diversity; temperature below 1 lowers diversity"
+      },
+      "distribution": {
+        "frechet_pca": 93.2249563399073,
+        "precision": 0.9375,
+        "coverage": 0.722000002861023,
+        "floor_other_real_training_slices": {
+          "frechet_pca": 21.32246080595428,
+          "precision": 0.96484375,
+          "coverage": 0.8579999804496765
+        },
+        "baseline_real_test_as_generated": {
+          "frechet_pca": 169.7920591108831,
+          "precision": 0.88671875,
+          "coverage": 0.2919999957084656
+        },
+        "note": "PCA-50 features, not Inception; reference = random training slices. floor = other real training slices (best a generator can do); baseline = real unseen patients (differs from training by patient)"
+      },
+      "plausibility": {
+        "mahalanobis_real_test": {
+          "mean": 36.441477588370994,
+          "median": 33.718833923339844,
+          "p95": 59.31417961120605
+        },
+        "mahalanobis_generated": {
+          "mean": 42.553611040115356,
+          "median": 34.86381721496582,
+          "p95": 89.53363418579102
+        },
+        "frac_generated_above_real_p99": 0.10546875,
+        "note": "outlier ranking only; inspect worst_generated_*.png (the failure autopsy) by eye",
+        "worst_generated_indices": [
+          50,
+          240,
+          88,
+          202,
+          118,
+          79,
+          8,
+          129,
+          48,
+          223,
+          215,
+          201,
+          209,
+          35,
+          61,
+          10
+        ]
+      },
+      "memorization": {
+        "nn_dist_generated_to_train": {
+          "mean": 25.42832536995411,
+          "median": 23.841449737548828,
+          "p95": 36.93398952484131
+        },
+        "ratio_gen_train_over_gen_test_equal_sized_refs": 0.8981713652610779,
+        "nn_ssim_generated_to_train": {
+          "mean": 0.39794989093206823,
+          "median": 0.396536260843277,
+          "p95": 0.4909135401248932
+        },
+        "frac_generated_with_nn_ssim_above_0.6": 0.0,
+        "note": "ratio clearly below 1, or many pairs above SSIM 0.6, suggests copying; compare with the test baseline"
+      }
+    }
+  },
+  "memorization_baseline_test_to_train": {
+    "nn_dist": {
+      "mean": 25.921905298586246,
+      "median": 24.9037446975708,
+      "p95": 32.400496292114255
+    },
+    "nn_ssim": {
+      "mean": 0.3313924313695342,
+      "median": 0.32995717227458954,
+      "p95": 0.3965131536126136
+    },
+    "frac_with_nn_ssim_above_0.6": 0.0,
+    "note": "real images from unseen patients; generated images should look no closer to training than this"
+  },
+  "vae_baseline_samples": {
+    "pairwise_ssim_generated": 0.4115017354488373,
+    "distribution": {
+      "frechet_pca": 112.48761662568972,
+      "precision": 0.96875,
+      "coverage": 0.6240000128746033
+    },
+    "frac_generated_with_nn_ssim_above_0.6": 0.0
+  },
+  "profile": {
+    "vqvae_params_m": 1.002881,
+    "prior_params_m": 5.014272,
+    "vqvae_train_time_s": 471.1706215000013,
+    "prior_train_time_s": 1273.2902856,
+    "vqvae_train_peak_gpu_mb": 431.74365234375,
+    "prior_train_peak_gpu_mb": 2052.6875,
+    "predict_peak_gpu_mb": 782.06396484375,
+    "generation_images_per_second": {
+      "T1.0_k0": 2.850493248125865,
+      "T0.8_k50": 2.8457202788655214
+    }
+  }
+}
