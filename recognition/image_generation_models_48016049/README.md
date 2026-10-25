@@ -1,6 +1,6 @@
 # Synthetic Hip-MRI Slices with a VQ-VAE and an Autoregressive Code Prior
 
-![Reconstructions](results_final/final_vqvae/test_reconstructions.png)
+![Reconstructions](images/result_final/final_vqvae/test_reconstructions.png)
 *Top row: real test slices. Bottom row: their VQ-VAE reconstructions (test SSIM 0.856 over all 540 test slices).*
 
 ---
@@ -129,7 +129,7 @@ File names such as `case_004_week_0_slice_0` identify the patient case, the scan
 
 - The provided folders split by **patient case**, not by slice. Neighbouring slices of one patient are almost identical, so a random
   slice-level split would leak near-duplicates into the test set and inflate every metric. `predict.py` checks this explicitly:
-  the case IDs shared between train/validate/test are **none** (`split_overlap_by_case` in `metrics.json`, empty in both runs).
+  the case IDs shared between train/validate/test are **none** (`split_overlap_by_case` in `metrics.json`, empty in both runs. File can be found in `images/results_final/final_vqvae/metrics.json`).
 - Validation images come from different patients than training images, which makes the validation curve an honest guard against
   overfitting and against the prior memorising training grids. The prior's validation loss does turn upward after epoch 12 (seed 0) and 18 (seed 1)
   while its training loss keeps falling, and the saved checkpoint is the one before that.
@@ -150,23 +150,23 @@ or a newly sampled grid decoded to a `(1, 256, 128)` image.
 
 | Figure | File |
 |---|---|
-| VQ-VAE training curves (loss, SSIM vs 0.6 target and VAE baseline, PSNR, codebook perplexity) | `models/final_vqvae/vqvae_training_curves.png` |
-| Prior training curves (cross-entropy and perplexity, train vs validation) | `models/final_prior/prior_training_curves.png` |
-| VAE training curves | `models/final_vae/vae_training_curves.png` |
-| Test reconstructions (real on top, reconstruction below) | `results_final/final_vqvae/test_reconstructions.png` |
-| Worst test reconstructions | `results_final/final_vqvae/worst_reconstructions.png` |
-| Reconstruction SSIM histogram | `results_final/final_vqvae/test_ssim_hist.png` |
-| Uncurated samples, T=1.0 (first 64, fixed seed) | `results_final/final_vqvae/samples_T1.0_k0.png` |
-| Interpolation (generated image blended into its nearest training scan) | `results_final/final_vqvae/interpolation_T1.0_k0.png` |
-| Codebook usage | `results_final/final_vqvae/code_usage.png` |
-| Most outlying generated images (failure autopsy) | `results_final/final_vqvae/worst_generated_T1.0_k0.png` |
-| Most outlying real test slices (control) | `results_final/final_vqvae/worst_real_test.png` |
-| Generated image next to its closest training scan | `results_final/final_vqvae/closest_to_train_T1.0_k0.png` |
-| VAE samples | `results_final/final_vqvae/vae_samples.png` |
+| VQ-VAE training curves (loss, SSIM vs 0.6 target and VAE baseline, PSNR, codebook perplexity) | `images/training_curve/vqvae_training_curves.png` |
+| Prior training curves (cross-entropy and perplexity, train vs validation) | `images/training_curve/prior_training_curves.png` |
+| VAE training curves | `images/training_curve/vae_training_curves.png` |
+| Test reconstructions (real on top, reconstruction below) | `images/results_final/final_vqvae/test_reconstructions.png` |
+| Worst test reconstructions | `images/results_final/final_vqvae/worst_reconstructions.png` |
+| Reconstruction SSIM histogram | `images/results_final/final_vqvae/test_ssim_hist.png` |
+| Uncurated samples, T=1.0 (first 64, fixed seed) | `images/results_final/final_vqvae/samples_T1.0_k0.png` |
+| Interpolation (generated image blended into its nearest training scan) | `images/results_final/final_vqvae/interpolation_T1.0_k0.png` |
+| Codebook usage | `images/results_final/final_vqvae/code_usage.png` |
+| Most outlying generated images (failure autopsy) | `images/results_final/final_vqvae/worst_generated_T1.0_k0.png` |
+| Most outlying real test slices (control) | `images/results_final/final_vqvae/worst_real_test.png` |
+| Generated image next to its closest training scan | `images/results_final/final_vqvae/closest_to_train_T1.0_k0.png` |
+| VAE samples | `images/results_final/final_vqvae/vae_samples.png` |
 
-![Training curves](models/final_vqvae/vqvae_training_curves.png)
-![Uncurated samples](results_final/final_vqvae/samples_T1.0_k0.png)
-![Interpolation](results_final/final_vqvae/interpolation_T1.0_k0.png)
+![Training curves](images/training_curve/vqvae_training_curves.png)
+![Uncurated samples](images/results_final/final_vqvae/samples_T1.0_k0.png)
+![Interpolation](images/results_final/final_vqvae/interpolation_T1.0_k0.png)
 
 ---
 
@@ -262,42 +262,45 @@ The 16 most outlying generated images at T=1.0 (seed 0) are in `worst_generated_
 211, 90, 228, 119, 1, 198, 216, 52, 177, 95, 178, 27, 114, 118, 184, 89. The 16 most outlying **real** test slices (`worst_real_test.png`) are the control,
 so a flagged image only counts as a failure if it is clearly worse than real outliers. Only 2.3 % (seed 0) to 4.7 % (seed 1) of T=1.0 samples exceed the real 99th-percentile score.
 
-![Worst generated](results_final/final_vqvae/worst_generated_T1.0_k0.png)
-![Worst real (control)](results_final/final_vqvae/worst_real_test.png)
+![Worst generated](images/results_final/final_vqvae/worst_generated_T1.0_k0.png)
+![Worst real (control)](images/results_final/final_vqvae/worst_real_test.png)
 
 **Control: what real outliers look like.** All 16 most outlying real test slices still show organised pelvic anatomy: a bright subcutaneous fat rim, layered muscle,
 a bright oval structure towards the top in several, round or ring-shaped structures along the midline, and left-right symmetry. They score as outliers because of
 unusual brightness, contrast or position, not because the anatomy is missing.
 
-**What the worst generated images share.** All 16 have a well-formed body outline and a bright fat rim, but the interior is a marbled
-pattern of sharp-edged folds and bands with no recognisable organ layout and no left-right symmetry. The texture is smoother and more stylised than the real slices' fine muscle and bone detail. In other words: **right outline, incoherent interior.**
-This differs from the real outliers, so the Mahalanobis ranking is finding genuinely different failures, not just unusual real anatomy.
-(I am not a radiologist; the anatomical labels above and below are descriptive and should be checked by someone clinically trained.)
+**What the worst generated images share.** The 16 images fail in different ways, but none has a coherent, recognisable anatomical layout. Typically the body outline is present, but the
+interior is a marbled pattern of sharp-edged folds and bands with no consistent organ arrangement or left-right symmetry, and the texture is smoother and more stylised than the real slices' fine muscle and bone detail.
+Some samples lose the outline too (the bright fat rim at the top and bottom of the image is missing or weak), and one is almost entirely a blur. This differs from the real outliers, which keep organised anatomy,
+so the Mahalanobis ranking is finding genuinely different failures, not just unusual real anatomy.
+(I am not a radiologist; the anatomical labels in this section, such as bladder, leg muscle and bone, are my own reading of the images and should be checked by someone clinically trained.)
 
-| # | Position in the figure (sample index) | What is wrong | Probable root trigger | Failure mode |
+The four examples below were chosen to show four different failures; the notes on each are my own observations.
+
+| # | Position in the figure (sample index) | What is wrong | Probable root trigger (hypothesis) | Failure mode |
 |---|---|---|---|---|
-| 1 | Row 1, col 1 (211), the most outlying | Interior is horizontal bands of bright and dark tissue with a bright blob at the left edge; no organs, no symmetry | The prior produced a code grid that is plausible patch by patch but has no consistent organ layout | Global incoherence with realistic local texture |
-| 2 | Row 1, col 2 (90) | A bright, well-defined oval sits mid-image (similar in appearance to the bright fluid-filled structure that real slices show near the top) but is surrounded by random folds instead of the structures that should surround it | One group of codes decodes to a convincing bright structure; the context around it was sampled without regard to it | Plausible structure in an impossible context |
-| 3 | Row 2, col 4 (27) | Dark bands slope diagonally across the image and the outline is slanted; real slices have horizontal layering | The first rows sampled an oblique texture, and the left-to-right, top-to-bottom scan then continued that pattern; it cannot go back and revise early codes | Wrong global orientation propagated by error compounding |
-| 4 | Row 2, col 7 (184) | A large sweeping diagonal fold crosses the middle and the top edge of the body outline bulges and is distorted | As in #3, plus unusual outline codes at the top of the scan | Outline distortion together with wrong layout |
+| 1 | Row 1, col 1 (211), the most outlying | The whole image is a blur with no distinctive or recognisable anatomical features | The prior sampled a code sequence that decodes to a low-detail texture with no organ structure; this is the extreme of the missing-features problem | Featureless image |
+| 2 | Row 1, col 2 (90) | A distinct, bright oval sits at the centre (presumably the bladder) but the surrounding structures are not coherent or recognisable. The bright outline along the sides of the body (top and bottom of the image) is missing, the same is true of row 1, col 5 (1) | One group of codes decodes to a convincing bright structure, while the codes around it, including the outline codes, were sampled without regard to it | Plausible structure in an impossible context, with a missing body-outline rim |
+| 3 | Row 1, col 8 (52) | The black patches on the left (presumably leg muscle) look coherent, but the white oval on the right (presumably the bladder) is contaminated by black smudges that should not exist | The two regions were sampled in different parts of the scan and nothing forces the later codes to keep the bright oval uniform; local texture from the dark region spilled into it | Right structure, wrong local texture (contamination) |
+| 4 | Row 2, col 4 (27) | The muscle structure is mostly fine, but there is no coherent bone structure: the white streaks do not look like realistic bone. Training slices that are similarly dark in the muscle regions do exist, but they still show clear, coherent bone | The prior reproduced the dark-muscle appearance, which is common in training, without the bone structure that should accompany it | Missing structure inside an otherwise realistic region |
 
-The other 12 images in the figure fall into the same families (marbled, no organs; bright patch in wrong context; diagonal or swirling layout).
-These causes are diagnosed from the images and from the metrics below. I did not instrument the model to log where in the 512-token scan each sample first goes wrong.
+The other 12 images in the figure fall into similar families: no organ layout, a plausible structure in the wrong context, or local texture contaminating a structure.
+These causes are hypotheses from looking at the images and from the metrics below. I did not instrument the model to log where in the 512-token scan each sample first goes wrong.
 
 **What the uncurated grid shows** (`samples_T1.0_k0.png`: the first 64 samples, T=1.0, fixed seed, no selection).
-![Uncurated samples](results_final/final_vqvae/samples_T1.0_k0.png)
-- Every sample has a well-formed body outline and a bright rim along the top or bottom edge, but the interior is generally dark with sharp-edged, polygon-like compartments.
+![Uncurated samples](images/results_final/final_vqvae/samples_T1.0_k0.png)
+- Most samples have a well-formed body outline and a bright rim along the top or bottom edge (at least two of the worst 16 lack it), but the interior is generally dark with sharp-edged, polygon-like compartments.
   Next to the real slices in `worst_real_test.png` the generated texture looks **stylised and low in fine detail**; I expect most samples would be recognisable as synthetic on sight.
-- In my rough count, **about 35 of 64 samples contain a bright, smooth oval** of varying size at a similar mid-image position; the rest do not. This is a hand count with some judgement involved, so treat it as accurate to within a few images.
+- In my rough count, **about 33 of 64 samples contain a bright, smooth oval** of varying size at a similar mid-image position; the rest do not. This is a hand count with some judgement involved, so treat it as accurate to within a few images.
 - The random **real** grid shows the same thing: roughly 35-40 of 64 real training slices contain a bright oval (most likely the bladder, at the slice levels where it appears), so the oval is a genuine feature at about the right frequency, not an over-represented motif.
   The oval's absence from the other samples is therefore not a failure in itself.
-![Random real training slices](results_final/final_vqvae/real_train_random64.png)
+![Random real training slices](images/results_final/final_vqvae/real_train_random64.png)
 - What the real slices have and the generated ones lack: clear ring-shaped structures on both sides of the pelvis (apparently the femoral heads), strong left-right symmetry, distinct bone and muscle boundaries, and fine texture.
   The generated samples reproduce the overall layout (outline, a bladder-like oval, dark muscle-like regions) but not these details. Real slices also vary more in contrast and appearance between slice levels, whereas generated samples share a common dark, compartmentalised look. (My reading of the two grids, not a measured quantity.)
 - So the quantitative metrics describe the samples more favourably than a direct look does. The metrics measure distance in a 50-component PCA space, which is dominated by coarse brightness layout, not by fine anatomical detail.
 
 Evidence behind the diagnosis:
-- *The decoder is not the cause of the structural failures.* The same decoder reconstructs every real test slice with SSIM of at least 0.80, and renders the failed samples' outline and texture cleanly. The fault is in the **code sequence**, i.e. the prior. (Blur is a separate problem and is the decoder's; see the sharpness table below.)
+- *The decoder is not the cause of the structural failures.* The same decoder reconstructs every real test slice with SSIM of at least 0.80, so it can represent real anatomy; the failed samples come from implausible code sequences. The fault is in the **code sequence**, i.e. the prior. (Blur is a separate problem and is the decoder's; see the sharpness table below.)
 - *It is not simply rare-token noise.* Lowering the temperature and restricting to the top 50 codes made the outlier rate **higher** (8-11 % against 2-5 %), and made the samples less varied, so the failures are not just "too random".
 - *The prior is the weak component.* Its cross-entropy of 4.18 / 4.24 nats per code is a perplexity of about 66-70 choices per token, so across 512 tokens there are many chances to leave the path of real anatomy, and a wrong early choice conditions everything after it.
   It also starts to overfit after epoch 12-18 with only 31 training patients (neighbouring slices of a patient are near-duplicates), so training longer did not help.
@@ -331,7 +334,9 @@ Together the two raters were right on 103 of 128 labels (80.5 %). Chance is 50 %
 - Caveats: two raters, neither a clinician; Rater A is the author and had seen generated images before (above); the raters labelled the same 64 images, so their results are not independent samples of images;
   the real images come from only the 3 test patients; it is one draw of 32 + 32 images; and the raters knew the mix was half real, half generated.
 - Three generated images (047.png, 020.png and 026.png in the study; the key confirms all three are generated and both raters identified them correctly) that the raters found obviously synthetic: a bright, featureless region with horizontal bands (left), layered folds with no organs (middle), and sweeping high-contrast bands (right).
-  ![Generated example 1](results_final/reader_study_examples/example_1.png) ![Generated example 2](results_final/reader_study_examples/example_2.png) ![Generated example 3](results_final/reader_study_examples/example_3.png)
+  ![Generated example 1](images/results_final/reader_study_examples/example_1.png) ![Generated example 2](images/results_final/reader_study_examples/example_2.png) ![Generated example 3](images/results_final/reader_study_examples/example_3.png)
+
+The study images, and the key (contains the answer and both raters' guesses) are in `images/results_final/reader_study`
 
 **Measured sharpness** (`sharpness.py`: mean gradient magnitude and Laplacian variance, higher is sharper; ratio to real test slices).
 
@@ -390,6 +395,72 @@ Do **not** present the output as clinically validated, use it for diagnosis, or 
 
 ## 7. Feasibility Review
 
+**Project objective**
+
+Develop a model to generate realistic, diverse, and anatomically coherent 2D hip MRI slices.
+The project investigates whether synthetic images can achieve reasonable structural fidelity without mode collapse, 
+anatomical hallucinations, or memorization of training scans.
+
+**Intended users**
+
+Medical imaging researchers and machine-learning engineers seeking to augment limited MRI
+datasets while reducing reliance on sharing original patient scans.
+
+**Prototype scope**
+
+Train a 2D WGAN with a Lipschitz-constrained critic using the HipMRI dataset, consisting of .nii.gz grayscale images with dimensions 256 × 128.
+If time allows, switch to VQ-VAE instead. Use a basic VAE as the reconstruction benchmark.
+
+*Note*: The model was switched to VQ-VAE early in research, and the WGAN model was scrapped before completion. No estimate training time was
+conducted for the VQ-VAE when this feasibility review was first written, and no estimations was conducted, nor was this review updated, at the
+time of the switch. 
+
+**Acceptance criteria**
+
+1. Structural fidelity: Achieve mean SSIM > 0.60 under a documented evaluation protocol, reporting
+sample variation and reference-selection methodology.
+2. Image diversity: Demonstrate that generated images cover a meaningful range of real-image
+features, using feature-space distances and coverage metrics to detect mode collapse.
+3. Memorization audit: Compare synthetic images against training and held-out MRI slices using pixel-
+space and perceptual nearest-neighbour distances; investigate suspiciously close matches.
+4. Anatomical plausibility: Evaluate uncurated sample grids, latent-space interpolation, and 3–5
+flawed generations for distorted tissue boundaries, artifacts, and implausible structures.
+5. Computational feasibility: Able to train on the Rangpur cluster in a reasonable amount of time
+
+**Dataset Configuration**
+
+Load the Nifti files using NiBabel. Verify image orientation, intensity ranges, dimensions, and patient
+identifiers. Preserve the 256 × 128 spatial resolution initially, remove the singleton channel dimension
+where appropriate, and normalize intensities consistently.
+
+**Chosen Model/Difficulty**
+
+WGAN/WGAN-GP (Normal Difficulty) . Possibly switching to VQ-VAE (Hard Difficulty) if time allows.
+
+**Estimated Training Time**
+
+A rough estimate based on the size of the training data and the Rangpur cluster’s capabilities
+Training configuration | Estimated time per epoch | 100 epochs
+Basic autoencoder | 15–60 seconds | 25 min–1.7 hours
+WGAN-GP, 3 critic updates | 1–2.5 minutes | 1.7–4.2 hours
+WGAN-GP, 5 critic updates | 1.5–4 minutes | 2.5–6.7 hours
+
+*Note*: As mentioned above, no estimation was performed for the VQ-VAE
+
+**Computing budget**
+
+Personal Desktop with Nvidia GeForce RTX5060ti (8 GB) for general training, upgrading to UQ Rangpur cluster if necessary.
+
+**Next experiment**
+
+If the VQ-VAE was successful, upgrade to VQ-VAE-2. Further improvements to the generative prior for the VQ-VAE model.
+
+**Fallback**
+
+If VQ-VAE is unable to produce sufficient results, the WGAN model acts as a fallback model for the project. 
+If WGAN training is unstable, reduce model capacity and adjust the gradient penalty and critic-update ratio. 
+If the model remains unreliable, retain the autoencoder as areconstruction benchmark and report the limitations 
+rather than claiming successful unconditional synthesis.
 
 ---
 
@@ -412,10 +483,9 @@ the audit below describes how I checked what I was given.
   precision/coverage, nearest-neighbour memorisation search, interpolation).
 - Debugging: a PyTorch/Pillow installation fault, a shape mismatch caused by off-size scans, a file-write error from a synced folder,
   an import error, and a GPU-memory/speed problem in the sampling loop.
-- Cleaning up the final code base (removing an abandoned WGAN-GP attempt, merging two prediction scripts) and explaining each file line by line.
-- Writing `verify_extras.py` and drafting this README from my results.
-- Early in the project I worked on a WGAN-GP; I abandoned it (it reached only about 0.38-0.43 reconstruction SSIM) and switched to the VQ-VAE.
-  No WGAN code remains in the submission.
+- Cleaning up the final code base (removing an abandoned WGAN-GP, merging two prediction scripts) and explaining each file line by line.
+- Writing helper scripts `verify_extras.py` and `sharpness.py`, and drafting this README from my results.
+- Early in the project I worked on a WGAN-GP; I abandoned it and switched to the VQ-VAE. No WGAN code remains in the submission.
 
 **How I audited, verified and tested the AI-suggested code.**
 - *Ran it.* I executed every script on my own machine, first with `--debug` smoke tests and module shape tests, then full runs, and read the console output.
